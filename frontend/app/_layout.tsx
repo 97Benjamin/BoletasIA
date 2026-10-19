@@ -4,6 +4,7 @@ import * as SplashScreen from 'expo-splash-screen';
 import { useEffect } from 'react';
 import 'react-native-reanimated';
 
+import { ThemeModeProvider } from '@/components/ThemeMode';
 import { useColorScheme } from '@/components/useColorScheme';
 
 export {
@@ -39,7 +40,11 @@ export default function RootLayout() {
     return null;
   }
 
-  return <RootLayoutNav />;
+  return (
+    <ThemeModeProvider>
+      <RootLayoutNav />
+    </ThemeModeProvider>
+  );
 }
 
 function RootLayoutNav() {

@@ -51,13 +51,30 @@ export default function TabLayout() {
       <Tabs.Screen
         name="two"
         options={{
-          title: 'Tab Two',
+          title: 'Transacciones',
           tabBarIcon: ({ color }) => (
             <SymbolView
               name={{
-                ios: 'chevron.left.forwardslash.chevron.right',
-                android: 'code',
-                web: 'code',
+                ios: 'list.bullet.rectangle',
+                android: 'receipt_long',
+                web: 'receipt',
+              }}
+              tintColor={color}
+              size={28}
+            />
+          ),
+        }}
+      />
+      <Tabs.Screen
+        name="scan"
+        options={{
+          title: 'Escanear',
+          tabBarIcon: ({ color }) => (
+            <SymbolView
+              name={{
+                ios: 'doc.viewfinder',
+                android: 'document_scanner',
+                web: 'document_scanner',
               }}
               tintColor={color}
               size={28}
