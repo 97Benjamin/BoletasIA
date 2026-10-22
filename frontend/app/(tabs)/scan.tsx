@@ -10,9 +10,11 @@ import {
 } from 'react-native';
 import type { ImagePickerAsset } from 'expo-image-picker';
 import * as ImagePicker from 'expo-image-picker';
+import { File, UploadType } from 'expo-file-system';
 
 import { Text, View } from '@/components/Themed';
 import { useThemeMode } from '@/components/ThemeMode';
+import SelectorFecha from '@/components/SelectorFecha';
 import { supabase } from '@/src/services/supabase';
 import { formatChileanPesos } from '@/src/utils/currency';
 
@@ -50,12 +52,6 @@ type ReceiptReview = {
   items: ReviewItem[];
 };
 type SavedReceipt = { transactionId: number | string; message: string };
-type ReactNativeFormData = FormData & {
-  append(
-    name: string,
-    value: { uri: string; name: string; type: string }
-  ): void;
-};
 
 const apiBaseUrl = process.env.EXPO_PUBLIC_API_URL?.trim().replace(/\/+$/, '');
 
@@ -206,6 +202,35 @@ export default function ScanReceiptScreen() {
     }
   }
 
+  async function takePhoto() {
+    setError('');
+    setSaved(null);
+    setReview(null);
+
+    try {
+      const permission = await ImagePicker.requestCameraPermissionsAsync();
+      if (!permission.granted) {
+        setError('Debes permitir el acceso a la cámara para fotografiar una boleta.');
+        return;
+      }
+
+      const capture = await ImagePicker.launchCameraAsync({
+        mediaTypes: ['images'],
+        allowsEditing: false,
+        quality: 0.85,
+      });
+      if (!capture.canceled) setImage(capture.assets[0] ?? null);
+    } catch (cameraError: unknown) {
+      setError(
+        `No se pudo abrir la cámara: ${
+          cameraError instanceof Error
+            ? cameraError.message
+            : 'Error desconocido'
+        }`
+      );
+    }
+  }
+
   async function requestApi(
     path: string,
     token: string,
@@ -249,6 +274,58 @@ export default function ScanReceiptScreen() {
         asRecord(payload)
           ? errorDetail(payload)
           : `El servidor respondió con el estado ${response.status}.`
+      );
+    }
+    return payload;
+  }
+
+  async function requestReceiptUpload(
+    path: string,
+    token: string,
+    asset: ImagePickerAsset,
+    mimeType: string,
+    fileName: string
+  ) {
+    // En nativo, el fetch de Expo (SDK 57) no soporta partes de FormData por
+    // uri ({ uri, name, type }), lanza "Unsupported FormDataPart
+    // implementation". La subida se hace con la API de FileSystem
+    // (multipart nativo), que bypassa ese conversor.
+    if (!apiBaseUrl) {
+      throw new Error(
+        'Falta configurar EXPO_PUBLIC_API_URL con la dirección del backend FastAPI.'
+      );
+    }
+    try {
+      const parsedUrl = new URL(apiBaseUrl);
+      if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+        throw new Error('EXPO_PUBLIC_API_URL debe usar HTTP o HTTPS.');
+      }
+    } catch (error: unknown) {
+      if (error instanceof Error && error.message.startsWith('EXPO_PUBLIC_API_URL')) {
+        throw error;
+      }
+      throw new Error('EXPO_PUBLIC_API_URL debe ser una dirección HTTP o HTTPS válida.');
+    }
+
+    const receiptFile = new File(asset.uri);
+    const upload = await receiptFile.upload(`${apiBaseUrl}${path}`, {
+      httpMethod: 'POST',
+      uploadType: UploadType.MULTIPART,
+      fieldName: 'file',
+      mimeType,
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    let payload: unknown = null;
+    try {
+      payload = JSON.parse(upload.body) as unknown;
+    } catch {
+      payload = null;
+    }
+    if (upload.status < 200 || upload.status >= 300) {
+      throw new Error(
+        asRecord(payload)
+          ? errorDetail(payload)
+          : `El servidor respondió con el estado ${upload.status}.`
       );
     }
     return payload;
@@ -344,24 +421,27 @@ export default function ScanReceiptScreen() {
       const fileName =
         image.fileName?.trim() ||
         `boleta-${Date.now()}.${mimeType.split('/')[1] ?? 'jpg'}`;
-      const formData = new FormData();
+
+      let payload: unknown;
       if (Platform.OS === 'web') {
         if (!image.file) throw new Error('No se pudo leer la imagen seleccionada.');
+        const formData = new FormData();
         formData.append('file', image.file, fileName);
+        payload = await requestApi(
+          '/gastos/procesar-boleta',
+          session.access_token,
+          formData,
+          false
+        );
       } else {
-        (formData as ReactNativeFormData).append('file', {
-          uri: image.uri,
-          name: fileName,
-          type: mimeType,
-        });
+        payload = await requestReceiptUpload(
+          '/gastos/procesar-boleta',
+          session.access_token,
+          image,
+          mimeType,
+          fileName
+        );
       }
-
-      const payload = await requestApi(
-        '/gastos/procesar-boleta',
-        session.access_token,
-        formData,
-        false
-      );
       if (!isReceiptPreview(payload)) {
         throw new Error('El servidor devolvió datos incompletos para la boleta.');
       }
@@ -736,19 +816,38 @@ export default function ScanReceiptScreen() {
             </View>
           )}
 
-          <TouchableOpacity
-            accessibilityRole="button"
-            onPress={() => void chooseImage()}
-            disabled={busy}
-            style={[
-              styles.secondaryButton,
-              { borderColor: isDark ? '#818cf8' : '#4f46e5' },
-            ]}
-          >
-            <Text style={styles.secondaryButtonText} lightColor="#4338ca" darkColor="#c7d2fe">
-              {image ? 'Cambiar imagen' : 'Elegir imagen'}
-            </Text>
-          </TouchableOpacity>
+          <View style={styles.imageActions} lightColor="transparent" darkColor="transparent">
+            <TouchableOpacity
+              accessibilityRole="button"
+              onPress={() => void chooseImage()}
+              disabled={busy}
+              style={[
+                styles.secondaryButton,
+                styles.imageActionButton,
+                { borderColor: isDark ? '#818cf8' : '#4f46e5' },
+                busy && styles.disabled,
+              ]}
+            >
+              <Text style={styles.secondaryButtonText} lightColor="#4338ca" darkColor="#c7d2fe">
+                {image ? 'Elegir otra imagen' : 'Elegir de galería'}
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              accessibilityRole="button"
+              onPress={() => void takePhoto()}
+              disabled={busy}
+              style={[
+                styles.secondaryButton,
+                styles.imageActionButton,
+                { borderColor: isDark ? '#818cf8' : '#4f46e5' },
+                busy && styles.disabled,
+              ]}
+            >
+              <Text style={styles.secondaryButtonText} lightColor="#4338ca" darkColor="#c7d2fe">
+                Tomar foto
+              </Text>
+            </TouchableOpacity>
+          </View>
           {image ? (
             <Text style={styles.helperText} lightColor="#6b7280" darkColor="#9ca3af">
               {image.fileName ?? 'Imagen seleccionada'}
@@ -784,13 +883,13 @@ export default function ScanReceiptScreen() {
             style={textInputStyle(isDark)}
           />
           <FieldLabel>Fecha (AAAA-MM-DD)</FieldLabel>
-          <TextInput
-            accessibilityLabel="Fecha"
-            value={review.date}
-            onChangeText={(date) => patchReview({ date })}
-            placeholder="2026-10-11"
-            placeholderTextColor={isDark ? '#9ca3af' : '#6b7280'}
-            style={textInputStyle(isDark)}
+          <SelectorFecha
+            valor={review.date}
+            alCambiar={(v: string) => patchReview({ date: v })}
+            contenedorEstilo={textInputStyle(isDark)}
+            textoEstilo={{ color: isDark ? '#f9fafb' : '#111827', fontSize: 16 }}
+            accesibilidadLabel="Fecha de la boleta"
+            bloquearFuturo
           />
           <FieldLabel>Total de la boleta</FieldLabel>
           <TextInput
@@ -1229,6 +1328,13 @@ const styles = StyleSheet.create({
     borderRadius: 10,
     paddingHorizontal: 12,
     marginTop: 12,
+  },
+  imageActions: {
+    flexDirection: 'row',
+    gap: 10,
+  },
+  imageActionButton: {
+    flex: 1,
   },
   secondaryButtonText: {
     fontSize: 15,

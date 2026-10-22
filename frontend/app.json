@@ -17,7 +17,12 @@
         "backgroundImage": "./assets/images/android-icon-background.png",
         "monochromeImage": "./assets/images/android-icon-monochrome.png"
       },
-      "predictiveBackGestureEnabled": false
+      "predictiveBackGestureEnabled": false,
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO"
+      ],
+      "package": "com.anonymous.frontend"
     },
     "web": {
       "bundler": "metro",
@@ -25,11 +30,13 @@
       "favicon": "./assets/images/favicon.png"
     },
     "plugins": [
+      "./plugins/withNetworkSecurityConfig",
       "expo-router",
       [
         "expo-image-picker",
         {
-          "photosPermission": "Permite acceder a tus fotos para seleccionar una boleta."
+          "photosPermission": "Permite acceder a tus fotos para seleccionar una boleta.",
+          "cameraPermission": "Permite usar la cámara para fotografiar una boleta."
         }
       ],
       [
@@ -39,7 +46,8 @@
           "resizeMode": "contain",
           "backgroundColor": "#ffffff"
         }
-      ]
+      ],
+      "@react-native-community/datetimepicker"
     ],
     "experiments": {
       "typedRoutes": true

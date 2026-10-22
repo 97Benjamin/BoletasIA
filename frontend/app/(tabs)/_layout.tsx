@@ -49,6 +49,40 @@ export default function TabLayout() {
         }}
       />
       <Tabs.Screen
+        name="scan"
+        options={{
+          title: 'Escanear',
+          tabBarIcon: ({ color }) => (
+            <SymbolView
+              name={{
+                ios: 'doc.viewfinder',
+                android: 'document_scanner',
+                web: 'document_scanner',
+              }}
+              tintColor={color}
+              size={28}
+            />
+          ),
+        }}
+      />
+      <Tabs.Screen
+        name="ingresos-gastos"
+        options={{
+          title: 'Ingresos y gastos',
+          tabBarIcon: ({ color }) => (
+            <SymbolView
+              name={{
+                ios: 'arrow.up.arrow.down',
+                android: 'swap_vert',
+                web: 'swap_vert',
+              }}
+              tintColor={color}
+              size={28}
+            />
+          ),
+        }}
+      />
+      <Tabs.Screen
         name="two"
         options={{
           title: 'Transacciones',
@@ -66,15 +100,15 @@ export default function TabLayout() {
         }}
       />
       <Tabs.Screen
-        name="scan"
+        name="ia"
         options={{
-          title: 'Escanear',
+          title: 'Asistente IA',
           tabBarIcon: ({ color }) => (
             <SymbolView
               name={{
-                ios: 'doc.viewfinder',
-                android: 'document_scanner',
-                web: 'document_scanner',
+                ios: 'sparkles',
+                android: 'auto_awesome',
+                web: 'auto_awesome',
               }}
               tintColor={color}
               size={28}

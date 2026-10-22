@@ -1,10 +1,19 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, Fragment, useRef } from 'react';
 import {
   ActivityIndicator,
+  Alert,
+  Dimensions,
+  Modal,
+  Platform,
   ScrollView,
   StyleSheet,
+  TextInput,
   TouchableOpacity,
+  type TextStyle,
+  type ViewStyle,
 } from 'react-native';
+import { LineChart } from 'react-native-chart-kit';
+import SelectorFecha from '@/components/SelectorFecha';
 import type { User } from '@supabase/supabase-js';
 import { Redirect } from 'expo-router';
 
@@ -40,7 +49,59 @@ type TransactionDetail = {
   extraDetails: Array<{ label: string; value: string }>;
   items: TransactionItem[];
   tags: string[];
+  // Datos crudos para edición de artículos
+  itemRows?: Array<{
+    id: number;
+    producto: string;
+    precio: number | null;
+    categoria_id: number | null;
+    subcategoria_id: number | null;
+    etiqueta_ids: number[];
+  }>;
 };
+
+type CuentaOpt = { id: number; nombre: string };
+type CategoriaOpt = { id: number; nombre: string };
+type SubcatOpt = { id: number; nombre: string; categoryId: number };
+type EtiquetaOpt = { id: number; nombre: string };
+
+function pad2(value: number) {
+  return String(value).padStart(2, '0');
+}
+
+function formatFecha(date: Date) {
+  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`;
+}
+
+function parseFecha(value: string) {
+  const [y, m, d] = value.split('-').map(Number);
+  if (!y || !m || !d) return new Date();
+  return new Date(y, m - 1, d);
+}
+
+function inputAmount(value: string) {
+  const normalized = value.trim().replace(/\s/g, '');
+  if (!normalized) return null;
+  let decimalValue = normalized;
+  if (normalized.includes(',')) {
+    decimalValue = normalized.replace(/\./g, '').replace(',', '.');
+  } else if (/^\d{1,3}(\.\d{3})+$/.test(normalized)) {
+    decimalValue = normalized.replace(/\./g, '');
+  }
+  const amount = Number(decimalValue);
+  return Number.isFinite(amount) && amount > 0 ? amount : null;
+}
+
+function titleCase(value: string) {
+  return value
+    .trim()
+    .replace(/\s+/g, ' ')
+    .split(' ')
+    .map((word) =>
+      word ? word.charAt(0).toUpperCase() + word.slice(1).toLowerCase() : ''
+    )
+    .join(' ');
+}
 
 function rowsOrThrow(data: unknown, error: { message: string } | null) {
   if (error) throw new Error(error.message);
@@ -80,9 +141,27 @@ function formatFieldName(field: string) {
     .join(' ');
 }
 
+// Detecta timestamps ISO (ej: 2026-10-20T16:11:28+00:00) y los muestra
+// como en Chile: hora 12h + día/mes/año → "1:11 PM 20/10/2026".
+function formatFechaHoraLegible(value: string): string | null {
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(value)) return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  const horas = date.getHours();
+  const minutos = String(date.getMinutes()).padStart(2, '0');
+  const periodo = horas >= 12 ? 'PM' : 'AM';
+  const hora12 = horas % 12 === 0 ? 12 : horas % 12;
+  return `${hora12}:${minutos} ${periodo} ${date.getDate()}/${
+    date.getMonth() + 1
+  }/${date.getFullYear()}`;
+}
+
 function formatFieldValue(value: unknown) {
   if (typeof value === 'boolean') return value ? 'Sí' : 'No';
-  if (typeof value === 'string' || typeof value === 'number') {
+  if (typeof value === 'string') {
+    return formatFechaHoraLegible(value) ?? value;
+  }
+  if (typeof value === 'number') {
     return String(value);
   }
   if (value !== null && value !== undefined) {
@@ -133,9 +212,117 @@ export default function TransactionsScreen() {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
   const [transactions, setTransactions] = useState<TransactionDetail[]>([]);
+  const [vista, setVista] = useState<'movimientos' | 'resumen'>('movimientos');
+
+  // --- Lógica de Resumen Robusta ---
+  // 1. Obtener todas las fechas disponibles
+  const todasLasFechas = transactions.map((t) => new Date(t.date).getTime());
+  const minTime = todasLasFechas.length > 0 ? Math.min(...todasLasFechas) : new Date().getTime();
+  const maxTime = new Date().getTime();
+  
+  const primeraFecha = new Date(minTime);
+  const hoy = new Date();
+  
+  // 2. Crear rango de días completo
+  const diasEntre = Math.max(1, Math.floor((hoy.getTime() - primeraFecha.getTime()) / (1000 * 60 * 60 * 24)) + 1);
+  const serieAcumulada: number[] = [];
+  const labels: string[] = [];
+  
+  let saldoAcumulado = 0;
+  for (let i = 0; i < diasEntre; i++) {
+    const fechaIteracion = new Date(primeraFecha);
+    fechaIteracion.setDate(primeraFecha.getDate() + i);
+    // Comparación estricta de fecha YYYY-MM-DD
+    const fechaStr = fechaIteracion.toISOString().split('T')[0];
+    
+    // Sumar movimientos de este día específico
+    const movsDelDia = transactions.filter(t => t.date === fechaStr);
+    movsDelDia.forEach(t => {
+      saldoAcumulado += (t.type === 'ingreso' ? t.total : -t.total);
+    });
+    
+    serieAcumulada.push(saldoAcumulado);
+    
+    // Labels legibles: mostrar inicio, fin y puntos intermedios
+    if (i === 0 || i === diasEntre - 1 || i % Math.max(1, Math.floor(diasEntre / 5)) === 0) {
+        labels.push(fechaStr.split('-')[2]); // Día
+    } else {
+        labels.push('');
+    }
+  }
+
+  const dataChart = {
+    labels: labels,
+    datasets: [
+      {
+        data: serieAcumulada,
+        strokeWidth: 2,
+        color: (opacity = 1) => `rgba(79, 70, 229, ${opacity})`,
+        withDots: false,
+      },
+      {
+        // Serie secundaria solo para los puntos donde hubo movimiento
+        data: serieAcumulada.map((val, i) => {
+            const fechaIteracion = new Date(primeraFecha);
+            fechaIteracion.setDate(primeraFecha.getDate() + i);
+            const fechaStr = fechaIteracion.toISOString().split('T')[0];
+            return transactions.some(t => t.date === fechaStr) ? val : null;
+        }),
+        withDots: true,
+      }
+    ],
+  };
   const [transactionsLoading, setTransactionsLoading] = useState(false);
   const [error, setError] = useState('');
   const [reload, setReload] = useState(0);
+
+  // Catálogos para editar transacciones
+  const [cuentaOptions, setCuentaOptions] = useState<CuentaOpt[]>([]);
+  const [categoriaOptions, setCategoriaOptions] = useState<CategoriaOpt[]>([]);
+  const [subcategoriaOptions, setSubcategoriaOptions] = useState<SubcatOpt[]>([]);
+  const [etiquetaOptions, setEtiquetaOptions] = useState<EtiquetaOpt[]>([]);
+
+  const [editOpen, setEditOpen] = useState(false);
+  const [editTx, setEditTx] = useState<TransactionDetail | null>(null);
+  const [eTipo, setETipo] = useState<'gasto' | 'ingreso'>('gasto');
+  const [eNombre, setENombre] = useState('');
+  const [eMonto, setEMonto] = useState('');
+  const [eFecha, setEFecha] = useState(formatFecha(new Date()));
+  const [eCuentaId, setECuentaId] = useState<number | null>(null);
+  const [eCategoriaId, setECategoriaId] = useState<number | null>(null);
+  const [eSubcatId, setESubcatId] = useState<number | null>(null);
+  const [eTagIds, setETagIds] = useState<number[]>([]);
+  const [eSaving, setESaving] = useState('');
+  const [eMessage, setEMessage] = useState('');
+  const [datePickerFor, setDatePickerFor] = useState(false);
+  const authEventReceived = useRef(false);
+  const [itemEdits, setItemEdits] = useState<Array<{
+    id: number;
+    producto: string;
+    precio: string;
+    categoriaId: number | null;
+    subcategoriaId: number | null;
+    etiquetaIds: number[];
+  }>>([]);
+
+  // Recalcula el total de la transacción cuando cambia algún artículo
+  // (al abrir el modal no pisa el total original)
+  const skipTotalPorArticulos = useRef(true);
+  useEffect(() => {
+    if (!editOpen) {
+      skipTotalPorArticulos.current = true;
+      return;
+    }
+    if (skipTotalPorArticulos.current) {
+      skipTotalPorArticulos.current = false;
+      return;
+    }
+    const suma = itemEdits.reduce((acc, it) => {
+      const n = it.precio ? Number(inputAmount(it.precio)) : 0;
+      return acc + (Number.isFinite(n) ? n : 0);
+    }, 0);
+    setEMonto(String(suma));
+  }, [itemEdits, editOpen]);
 
   useEffect(() => {
     let isMounted = true;
@@ -178,6 +365,89 @@ export default function TransactionsScreen() {
       subscription.unsubscribe();
     };
   }, []);
+
+  useEffect(() => {
+    const userId = user?.id;
+    if (!userId) {
+      setCuentaOptions([]);
+      setCategoriaOptions([]);
+      setSubcategoriaOptions([]);
+      setEtiquetaOptions([]);
+      return;
+    }
+    let isMounted = true;
+
+    async function loadCatalog() {
+      const [cuentaResult, categoriaResult, subcatResult, tagResult] =
+        await Promise.all([
+          supabase
+            .from('cuentas')
+            .select('id, nombre')
+            .eq('user_id', userId)
+            .order('nombre'),
+          supabase
+            .from('categorias')
+            .select('id, nombre, user_id')
+            .or(`user_id.is.null,user_id.eq.${userId}`)
+            .order('nombre'),
+          supabase
+            .from('subcategorias')
+            .select('id, nombre, categoria_id, user_id')
+            .or(`user_id.is.null,user_id.eq.${userId}`)
+            .order('nombre'),
+          supabase
+            .from('etiquetas')
+            .select('id, nombre, user_id')
+            .or(`user_id.is.null,user_id.eq.${userId}`)
+            .order('nombre'),
+        ]);
+      if (!isMounted) return;
+      const mapSimple = (rows: unknown[]) =>
+        (rows ?? [])
+          .map((row) => {
+            const record = row as { id: unknown; nombre: unknown };
+            if (
+              typeof record.id !== 'number' ||
+              typeof record.nombre !== 'string'
+            ) {
+              return null;
+            }
+            return { id: record.id, nombre: record.nombre.trim() };
+          })
+          .filter((item): item is CuentaOpt => item !== null);
+      setCuentaOptions(mapSimple(cuentaResult.data ?? []));
+      setCategoriaOptions(mapSimple(categoriaResult.data ?? []));
+      const subcatRows = (subcatResult.data ?? []) as {
+        id: unknown;
+        nombre: unknown;
+        categoria_id: unknown;
+      }[];
+      setSubcategoriaOptions(
+        subcatRows.flatMap((row) => {
+          if (
+            typeof row.id !== 'number' ||
+            typeof row.nombre !== 'string' ||
+            typeof row.categoria_id !== 'number'
+          ) {
+            return [];
+          }
+          return [
+            {
+              id: row.id,
+              nombre: row.nombre.trim(),
+              categoryId: row.categoria_id,
+            },
+          ];
+        })
+      );
+      setEtiquetaOptions(mapSimple(tagResult.data ?? []));
+    }
+
+    void loadCatalog();
+    return () => {
+      isMounted = false;
+    };
+  }, [user?.id]);
 
   useEffect(() => {
     const userId = user?.id;
@@ -442,6 +712,24 @@ export default function TransactionsScreen() {
                 return name ? [name] : [];
               }),
             })),
+            itemRows: rowItems.map((item) => ({
+              id: Number(readId(item, 'id') ?? 0),
+              producto: readText(item, 'producto') ?? '',
+              precio: readAmount(item, 'precio'),
+              categoria_id:
+                readId(item, 'categoria_id') === null
+                  ? null
+                  : Number(readId(item, 'categoria_id')),
+              subcategoria_id:
+                readId(item, 'subcategoria_id') === null
+                  ? null
+                  : Number(readId(item, 'subcategoria_id')),
+              etiqueta_ids: (tagsByItem.get(String(readId(item, 'id'))) ?? [])
+                .flatMap((tagLink) => {
+                  const tagId = readId(tagLink, 'etiqueta_id');
+                  return tagId === null ? [] : [Number(tagId)];
+                }),
+            })),
             tags: rowTags.flatMap((tagLink) => {
               const tagId = readId(tagLink, 'etiqueta_id');
               if (tagId === null) return [];
@@ -473,6 +761,313 @@ export default function TransactionsScreen() {
       isMounted = false;
     };
   }, [user?.id, reload]);
+
+  function toggleTag(list: number[], id: number) {
+    return list.includes(id)
+      ? list.filter((value) => value !== id)
+      : [...list, id];
+  }
+
+  async function resolverComercio(nombre: string): Promise<number | null> {
+    const limpio = titleCase(nombre);
+    if (!limpio) return null;
+    const { data: found } = await supabase
+      .from('comercios')
+      .select('id')
+      .ilike('nombre', limpio)
+      .limit(1);
+    if (found && found.length > 0) {
+      const id = (found[0] as { id: unknown }).id;
+      return typeof id === 'number' ? id : null;
+    }
+    const { data: created, error: insertError } = await supabase
+      .from('comercios')
+      .insert({ nombre: limpio })
+      .select('id');
+    if (insertError) return null;
+    if (created && created.length > 0) {
+      const id = (created[0] as { id: unknown }).id;
+      return typeof id === 'number' ? id : null;
+    }
+    return null;
+  }
+
+  function abrirEdicion(tx: TransactionDetail) {
+    setEditTx(tx);
+    setETipo(tx.type === 'ingreso' ? 'ingreso' : 'gasto');
+    setENombre(tx.merchant ?? '');
+    setEMonto(tx.total !== null ? String(tx.total) : '');
+    setEFecha(tx.date ?? formatFecha(new Date()));
+    setECategoriaId(
+      tx.category
+        ? (categoriaOptions.find((c) => c.nombre === tx.category)?.id ?? null)
+        : null
+    );
+    setESubcatId(
+      tx.subcategory
+        ? (subcategoriaOptions.find((s) => s.nombre === tx.subcategory)?.id ?? null)
+        : null
+    );
+    setECuentaId(
+      tx.account
+        ? (cuentaOptions.find((c) => c.nombre === tx.account)?.id ?? null)
+        : null
+    );
+    setETagIds(
+      etiquetaOptions
+        .filter((tag) => tx.tags.includes(tag.nombre))
+        .map((tag) => tag.id)
+    );
+    // Cargar artículos para edición
+    const itemIds = (tx as Record<string, unknown>).itemIds as number[] | undefined;
+    const itemData = (tx as Record<string, unknown>).itemRows as Array<{ id: number; producto: string; precio: number | null; categoria_id: number | null; subcategoria_id: number | null; etiqueta_ids: number[] }> | undefined;
+    setItemEdits(
+      (itemData ?? (tx.items || []).map((item, idx) => ({
+        id: itemIds?.[idx] ?? idx + 1,
+        producto: item.product ?? '',
+        precio: item.price !== null ? String(item.price) : '',
+        categoriaId: null,
+        subcategoriaId: null,
+        etiquetaIds: [],
+      }))).map((row: any) => ({
+        id: row.id ?? 0,
+        producto: row.producto ?? (row.product ?? ''),
+        precio: row.precio !== null && typeof row.precio === 'number' ? String(row.precio) : (row.precio ?? ''),
+        categoriaId: row.categoriaId ?? row.categoria_id ?? null,
+        subcategoriaId: row.subcategoriaId ?? row.subcategoria_id ?? null,
+        etiquetaIds: row.etiquetaIds ?? row.etiqueta_ids ?? [],
+      }))
+    );
+    setESaving('');
+    setEMessage('');
+    setEditOpen(true);
+  }
+
+  async function guardarEdicion() {
+    if (!editTx || eSaving) return;
+    const transaccionId = Number(editTx.id);
+    if (!Number.isFinite(transaccionId)) {
+      setESaving('ID de transacción inválido.');
+      return;
+    }
+    const monto = inputAmount(eMonto);
+    if (monto === null) {
+      setESaving('Escribe un monto válido mayor que cero.');
+      return;
+    }
+    if (eCuentaId === null) {
+      setESaving(
+        'Elige la cuenta asociada (crea una en "Mi cuenta" si aún no tienes).'
+      );
+      return;
+    }
+    if (eSubcatId !== null && eCategoriaId === null) {
+      setESaving('Para subcategoría primero elige una categoría.');
+      return;
+    }
+    setESaving('Guardando...');
+    try {
+      const comercioId = await resolverComercio(eNombre);
+      const { error: updateError } = await supabase
+        .from('transacciones')
+        .update({
+          tipo: eTipo,
+          cuenta_id: eCuentaId,
+          comercio_id: comercioId,
+          categoria_id: eCategoriaId,
+          subcategoria_id: eCategoriaId === null ? null : eSubcatId,
+          fecha: eFecha,
+          total: String(monto),
+          actualizado_en: new Date().toISOString(),
+        })
+        .eq('id', transaccionId);
+      if (updateError) throw updateError;
+
+      // Borrar artículos eliminados de la edición
+      const idsOriginales = (editTx.itemRows ?? []).map((r) => r.id);
+      const idsActuales = new Set(itemEdits.map((it) => it.id));
+      for (const idOrig of idsOriginales) {
+        if (!idsActuales.has(idOrig)) {
+          await supabase
+            .from('transaccion_item_etiquetas')
+            .delete()
+            .eq('transaccion_item_id', idOrig);
+          await supabase
+            .from('transaccion_items')
+            .delete()
+            .eq('id', idOrig);
+        }
+      }
+
+      // Actualizar / crear artículos y sincronizar sus etiquetas
+      for (const item of itemEdits) {
+        if (!item.producto.trim()) continue;
+        const precioNum = item.precio ? Number(inputAmount(item.precio)) : null;
+        if (item.id > 10000 || item.id < 0) {
+          // artículo nuevo
+          const { data: newItem } = await supabase
+            .from('transaccion_items')
+            .insert({
+              transaccion_id: transaccionId,
+              producto: item.producto.trim(),
+              precio: precioNum,
+              categoria_id: item.categoriaId,
+              subcategoria_id: item.subcategoriaId,
+            })
+            .select('id');
+          const newId = (newItem as { id: number }[] | null)?.[0]?.id;
+          if (typeof newId === 'number' && (item.etiquetaIds ?? []).length > 0) {
+            await supabase.from('transaccion_item_etiquetas').insert(
+              item.etiquetaIds.map((etiquetaId) => ({
+                transaccion_item_id: newId,
+                etiqueta_id: etiquetaId,
+              }))
+            );
+          }
+        } else {
+          await supabase
+            .from('transaccion_items')
+            .update({
+              producto: item.producto.trim(),
+              precio: precioNum,
+              categoria_id: item.categoriaId,
+              subcategoria_id: item.subcategoriaId,
+            })
+            .eq('id', item.id);
+          await supabase
+            .from('transaccion_item_etiquetas')
+            .delete()
+            .eq('transaccion_item_id', item.id);
+          if ((item.etiquetaIds ?? []).length > 0) {
+            await supabase.from('transaccion_item_etiquetas').insert(
+              item.etiquetaIds.map((etiquetaId) => ({
+                transaccion_item_id: item.id,
+                etiqueta_id: etiquetaId,
+              }))
+            );
+          }
+        }
+      }
+
+      // Etiquetas de transacción: reemplazar
+      const { error: deleteTagsError } = await supabase
+        .from('transaccion_etiquetas')
+        .delete()
+        .eq('transaccion_id', transaccionId);
+      if (deleteTagsError) throw deleteTagsError;
+      if (eTagIds.length > 0) {
+        const { error: insertTagsError } = await supabase
+          .from('transaccion_etiquetas')
+          .insert(
+            eTagIds.map((etiquetaId) => ({
+              transaccion_id: transaccionId,
+              etiqueta_id: etiquetaId,
+            }))
+          );
+        if (insertTagsError) throw insertTagsError;
+      }
+
+      setEMessage('Transacción actualizada.');
+      setEditOpen(false);
+      setReload((value) => value + 1);
+    } catch (saveError: unknown) {
+      setESaving(
+        `No se pudo guardar: ${
+          saveError instanceof Error ? saveError.message : 'Error desconocido'
+        }`
+      );
+    }
+  }
+
+  function eliminarTransaccion(tx: TransactionDetail) {
+    Alert.alert(
+      'Eliminar transacción',
+      `¿Eliminar esta transacción${tx.merchant ? ` de "${tx.merchant}"` : ''}? Se borrarán también sus artículos y etiquetas.`,
+      [
+        { text: 'Cancelar', style: 'cancel' },
+        {
+          text: 'Eliminar',
+          style: 'destructive',
+          onPress: () => {
+            void (async () => {
+              const transaccionId = Number(tx.id);
+              if (!Number.isFinite(transaccionId)) return;
+              await supabase
+                .from('transaccion_etiquetas')
+                .delete()
+                .eq('transaccion_id', transaccionId);
+              await supabase
+                .from('transaccion_items')
+                .delete()
+                .eq('transaccion_id', transaccionId);
+              const { error: deleteError } = await supabase
+                .from('transacciones')
+                .delete()
+                .eq('id', transaccionId);
+              if (deleteError) {
+                setError(`No se pudo eliminar: ${deleteError.message}`);
+                return;
+              }
+              setReload((value) => value + 1);
+            })();
+          },
+        },
+      ]
+    );
+  }
+
+  const subcategoriaOptionsFiltradas = subcategoriaOptions.filter(
+    (sub) => sub.categoryId === eCategoriaId
+  );
+  const eSubcatOptions = subcategoriaOptionsFiltradas;
+  // Chips inactivos con buen contraste en ambos temas (igual que en ingresos-gastos)
+  const chipInactivo = [
+    styles.chip,
+    {
+      borderColor: colorScheme === 'dark' ? '#94a3b8' : '#c7d2fe',
+      backgroundColor: colorScheme === 'dark' ? '#1e293b' : '#e0e7ff',
+    },
+  ];
+  const chipTextoInactivo = [
+    { fontSize: 13, fontWeight: '600' as const },
+    { color: colorScheme === 'dark' ? '#e2e8f0' : '#4338ca' },
+  ];
+  // Tarjeta de artículo: gris azulado que armoniza con los chips y los inputs
+  const itemCardStyle = [
+    styles.itemEditCard,
+    colorScheme === 'dark'
+      ? { backgroundColor: '#1e293b', borderColor: '#334155' }
+      : { backgroundColor: '#f1f5f9', borderColor: '#e2e8f0' },
+  ];
+  // Botón "Eliminar artículo": rojo sólido compacto (ocupa solo lo del texto)
+  const eliminarItemStyle = [
+    styles.miniBotonEliminar,
+    { backgroundColor: colorScheme === 'dark' ? '#7f1d1d' : '#b91c1c' },
+  ];
+  const eliminarItemTextStyle = [
+    styles.miniBotonEliminarText,
+    { color: colorScheme === 'dark' ? '#fecaca' : '#ffffff' },
+  ];
+  const inputColors = {
+    borderColor: colorScheme === 'dark' ? '#4b5563' : '#d1d5db',
+    backgroundColor: colorScheme === 'dark' ? '#111827' : '#ffffff',
+    color: colorScheme === 'dark' ? '#f9fafb' : '#111827',
+  };
+  const inputStyle = [
+    styles.input,
+    {
+      borderColor: inputColors.borderColor,
+      backgroundColor: inputColors.backgroundColor,
+      color: inputColors.color,
+    },
+  ];
+  const inputBoxStyle = [
+    styles.input,
+    {
+      borderColor: inputColors.borderColor,
+      backgroundColor: inputColors.backgroundColor,
+    },
+  ];
 
   if (loading) {
     return (
@@ -520,7 +1115,36 @@ export default function TransactionsScreen() {
           </Text>
         </View>
       ) : (
-        transactions.map((transaction) => (
+        <>
+          <View style={styles.toggleContainer}>
+            <TouchableOpacity onPress={() => setVista('movimientos')} style={[styles.toggleButton, vista === 'movimientos' && styles.toggleButtonActive]}>
+              <Text style={vista === 'movimientos' ? styles.toggleTextActive : styles.toggleText}>Movimientos</Text>
+            </TouchableOpacity>
+            <TouchableOpacity onPress={() => setVista('resumen')} style={[styles.toggleButton, vista === 'resumen' && styles.toggleButtonActive]}>
+              <Text style={vista === 'resumen' ? styles.toggleTextActive : styles.toggleText}>Resumen</Text>
+            </TouchableOpacity>
+          </View>
+
+          {vista === 'resumen' ? (
+            <View style={styles.card} lightColor="#ffffff" darkColor="#1f2937">
+              <Text style={styles.sectionTitle}>Estado de resultados</Text>
+              <LineChart
+                data={dataChart}
+                width={Dimensions.get('window').width - 40}
+                height={220}
+                chartConfig={{
+                  backgroundColor: '#1f2937',
+                  backgroundGradientFrom: '#1f2937',
+                  backgroundGradientTo: '#111827',
+                  color: (opacity = 1) => `rgba(79, 70, 229, ${opacity})`,
+                  labelColor: (opacity = 1) => `rgba(156, 163, 175, ${opacity})`,
+                }}
+                bezier
+                style={{ marginVertical: 8, borderRadius: 16 }}
+              />
+            </View>
+          ) : (
+            transactions.map((transaction) => (
           <View
             key={transaction.id}
             style={styles.card}
@@ -536,9 +1160,14 @@ export default function TransactionsScreen() {
                   {transaction.merchant ?? 'Comercio no especificado'}
                 </Text>
               </View>
-              <Text style={styles.total}>
-                {formatAmount(transaction.total)}
-              </Text>
+              <View style={{flexDirection:'row',gap:8}} lightColor="transparent" darkColor="transparent">
+                <Text style={styles.total}>
+                  {formatAmount(transaction.total)}
+                </Text>
+                <TouchableOpacity onPress={()=>abrirEdicion(transaction)} style={[styles.editButton,{backgroundColor:'#4f46e5',borderColor:'#4f46e5'}]}>
+                  <Text style={[styles.editButtonText,{color:"#ffffff"}]}>✎ Editar</Text>
+                </TouchableOpacity>
+              </View>
             </View>
 
             <View
@@ -548,6 +1177,7 @@ export default function TransactionsScreen() {
             />
 
             <View style={styles.detailsGrid} lightColor="transparent" darkColor="transparent">
+              <Detail label="Fecha de transacción" value={formatDate(transaction.date)} fullWidth />
               <Detail label="Tipo" value={transaction.type} />
               <Detail label="Categoría" value={transaction.category} />
               <Detail label="Subcategoría" value={transaction.subcategory} />
@@ -563,7 +1193,6 @@ export default function TransactionsScreen() {
                 }
               />
               <Detail label="Frecuencia" value={transaction.frequency} />
-              <Detail label="ID de transacción" value={transaction.id} />
               {transaction.extraDetails.map((detail) => (
                 <Detail
                   key={`${transaction.id}-${detail.label}`}
@@ -637,18 +1266,478 @@ export default function TransactionsScreen() {
           </View>
         ))
       )}
+        </>
+      )}
+
+      <Modal
+        visible={editOpen}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setEditOpen(false)}
+      >
+        <TouchableOpacity
+          style={styles.modalBackdrop}
+          activeOpacity={1}
+          onPress={() => setEditOpen(false)}
+        >
+          <TouchableOpacity activeOpacity={1} onPress={() => {}}>
+            <View style={{ maxHeight: '85%', overflow: 'hidden' }} lightColor="transparent" darkColor="transparent">
+            <ScrollView contentContainerStyle={{ padding: 24, paddingBottom: 36 }} style={{ maxHeight: 600 }} showsVerticalScrollIndicator={false}>
+            <View
+              style={[
+                styles.modalCard,
+                colorScheme === 'dark'
+                  ? { backgroundColor: '#111827' }
+                  : { backgroundColor: '#ffffff' },
+              ]}
+            >
+              <Text style={styles.modalTitle}>Editar transacción</Text>
+              <Text
+                style={styles.modalSub}
+                lightColor="#6b7280"
+                darkColor="#9ca3af"
+              >
+                {editTx?.merchant ?? 'Sin comercio'} ·{' '}
+                {formatAmount(editTx?.total ?? null)}
+              </Text>
+
+              <View
+                style={styles.chipRow}
+                lightColor="transparent"
+                darkColor="transparent"
+              >
+                {(['gasto', 'ingreso'] as const).map((tipoOpcion) => (
+                  <TouchableOpacity
+                    key={tipoOpcion}
+                    accessibilityRole="button"
+                    onPress={() => setETipo(tipoOpcion)}
+                    style={[chipInactivo, eTipo === tipoOpcion && styles.chipActivo]}
+                  >
+                    <Text
+                      style={[
+                        chipTextoInactivo,
+                        eTipo === tipoOpcion ? styles.chipTextActivo : null,
+                      ]}
+                    >
+                      {tipoOpcion === 'gasto' ? '⬇️ Gasto' : '⬆️ Ingreso'}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+
+              <TextInput
+                style={inputStyle}
+                value={eNombre}
+                onChangeText={setENombre}
+                placeholder="Comercio (ej: Panadería La Espiga)"
+                placeholderTextColor={
+                  colorScheme === 'dark' ? '#9ca3af' : '#6b7280'
+                }
+                autoCapitalize="sentences"
+              />
+              <TextInput
+                style={inputStyle}
+                value={eMonto}
+                onChangeText={setEMonto}
+                placeholder="Monto (ej: 12.990)"
+                placeholderTextColor={
+                  colorScheme === 'dark' ? '#9ca3af' : '#6b7280'
+                }
+                keyboardType={Platform.OS === 'web' ? 'default' : 'numeric'}
+              />
+
+              <SelectorFecha
+                valor={eFecha}
+                alCambiar={setEFecha}
+                contenedorEstilo={inputBoxStyle}
+                textoEstilo={[
+                  { fontSize: 16, color: colorScheme === 'dark' ? '#f9fafb' : '#111827' },
+                ]}
+                accesibilidadLabel="Fecha de la transacción"
+                bloquearFuturo
+              />
+
+              <Text style={styles.labelMini} lightColor="#6b7280" darkColor="#9ca3af">
+                Cuenta
+              </Text>
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                contentContainerStyle={styles.chipRow}
+                style={styles.chipScroll}
+              >
+                {cuentaOptions.map((cuenta) => (
+                  <TouchableOpacity
+                    key={cuenta.id}
+                    accessibilityRole="button"
+                    onPress={() => setECuentaId(cuenta.id)}
+                    style={[chipInactivo, eCuentaId === cuenta.id && styles.chipActivo]}
+                  >
+                    <Text
+                      style={[
+                        chipTextoInactivo,
+                        eCuentaId === cuenta.id ? styles.chipTextActivo : null,
+                      ]}
+                    >
+                      {cuenta.nombre}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </ScrollView>
+
+              <Text style={styles.labelMini} lightColor="#6b7280" darkColor="#9ca3af">
+                Categoría
+              </Text>
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                contentContainerStyle={styles.chipRow}
+                style={styles.chipScroll}
+              >
+                <TouchableOpacity
+                  accessibilityRole="button"
+                  onPress={() => {
+                    setECategoriaId(null);
+                    setESubcatId(null);
+                  }}
+                  style={[chipInactivo, eCategoriaId === null && styles.chipActivo]}
+                >
+                  <Text
+                    style={[
+                      chipTextoInactivo,
+                      eCategoriaId === null ? styles.chipTextActivo : null,
+                    ]}
+                  >
+                    Sin categoría
+                  </Text>
+                </TouchableOpacity>
+                {categoriaOptions.map((categoria) => (
+                  <TouchableOpacity
+                    key={categoria.id}
+                    accessibilityRole="button"
+                    onPress={() => {
+                      setECategoriaId(categoria.id);
+                      setESubcatId(null);
+                    }}
+                    style={[
+                      chipInactivo,
+                      eCategoriaId === categoria.id && styles.chipActivo,
+                    ]}
+                  >
+                    <Text
+                      style={[
+                        chipTextoInactivo,
+                        eCategoriaId === categoria.id
+                          ? styles.chipTextActivo
+                          : null,
+                      ]}
+                    >
+                      {categoria.nombre}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </ScrollView>
+
+              {eCategoriaId !== null && eSubcatOptions.length > 0 ? (
+                <>
+                  <Text style={styles.labelMini} lightColor="#6b7280" darkColor="#9ca3af">
+                    Subcategoría
+                  </Text>
+                  <ScrollView
+                    horizontal
+                    showsHorizontalScrollIndicator={false}
+                    contentContainerStyle={styles.chipRow}
+                    style={styles.chipScroll}
+                  >
+                    <TouchableOpacity
+                      accessibilityRole="button"
+                      onPress={() => setESubcatId(null)}
+                      style={[chipInactivo, eSubcatId === null && styles.chipActivo]}
+                    >
+                      <Text
+                        style={[
+                          chipTextoInactivo,
+                          eSubcatId === null ? styles.chipTextActivo : null,
+                        ]}
+                      >
+                        Ninguna
+                      </Text>
+                    </TouchableOpacity>
+                    {eSubcatOptions.map((subcat) => (
+                      <TouchableOpacity
+                        key={subcat.id}
+                        accessibilityRole="button"
+                        onPress={() => setESubcatId(subcat.id)}
+                        style={[
+                          chipInactivo,
+                          eSubcatId === subcat.id && styles.chipActivo,
+                        ]}
+                      >
+                        <Text
+                          style={[
+                            chipTextoInactivo,
+                            eSubcatId === subcat.id
+                              ? styles.chipTextActivo
+                              : null,
+                          ]}
+                        >
+                          {subcat.nombre}
+                        </Text>
+                      </TouchableOpacity>
+                    ))}
+                  </ScrollView>
+                </>
+              ) : null}
+
+              {etiquetaOptions.length > 0 ? (
+                <>
+                  <Text style={styles.labelMini} lightColor="#6b7280" darkColor="#9ca3af">
+                    Etiquetas
+                  </Text>
+                  <ScrollView
+                    horizontal
+                    showsHorizontalScrollIndicator={false}
+                    contentContainerStyle={styles.chipRow}
+                    style={styles.chipScroll}
+                  >
+                    {etiquetaOptions.map((etiqueta) => (
+                      <TouchableOpacity
+                        key={etiqueta.id}
+                        accessibilityRole="button"
+                        onPress={() =>
+                          setETagIds((previo) => toggleTag(previo, etiqueta.id))
+                        }
+                        style={[
+                          chipInactivo,
+                          eTagIds.includes(etiqueta.id) && styles.chipActivo,
+                        ]}
+                      >
+                        <Text
+                          style={[
+                            chipTextoInactivo,
+                            eTagIds.includes(etiqueta.id)
+                              ? styles.chipTextActivo
+                              : null,
+                          ]}
+                        >
+                          #{etiqueta.nombre}
+                        </Text>
+                      </TouchableOpacity>
+                    ))}
+                  </ScrollView>
+                </>
+              ) : null}
+
+              {itemEdits.length > 0 ? (
+                <>
+                  <Text style={styles.labelMini} lightColor="#6b7280" darkColor="#9ca3af">
+                    Artículos de la transacción
+                  </Text>
+                  {itemEdits.map((item, idx) => (
+                    <View
+                      key={item.id}
+                      style={itemCardStyle}
+                    >
+                      <TextInput
+                        style={inputStyle}
+                        value={item.producto}
+                        onChangeText={(text) =>
+                          setItemEdits((prev) =>
+                            prev.map((it, i) =>
+                              i === idx ? { ...it, producto: text } : it
+                            )
+                          )
+                        }
+                        placeholder="Nombre del artículo"
+                        placeholderTextColor={
+                          colorScheme === 'dark' ? '#9ca3af' : '#6b7280'
+                        }
+                      />
+                      <TextInput
+                        style={inputStyle}
+                        value={item.precio}
+                        onChangeText={(text) =>
+                          setItemEdits((prev) =>
+                            prev.map((it, i) =>
+                              i === idx ? { ...it, precio: text } : it
+                            )
+                          )
+                        }
+                        placeholder="Precio (ej: 3.500)"
+                        placeholderTextColor={
+                          colorScheme === 'dark' ? '#9ca3af' : '#6b7280'
+                        }
+                        keyboardType={Platform.OS === 'web' ? 'default' : 'numeric'}
+                      />
+                      <ScrollView
+                        horizontal
+                        showsHorizontalScrollIndicator={false}
+                        contentContainerStyle={styles.chipRow}
+                        style={styles.chipScroll}
+                      >
+                        {categoriaOptions.map((cat) => (
+                          <TouchableOpacity
+                            key={cat.id}
+                            accessibilityRole="button"
+                            onPress={() =>
+                              setItemEdits((prev) =>
+                                prev.map((it, i) =>
+                                  i === idx
+                                    ? { ...it, categoriaId: cat.id, subcategoriaId: null }
+                                    : it
+                                )
+                              )
+                            }
+                            style={[
+                              chipInactivo,
+                              item.categoriaId === cat.id && styles.chipActivo,
+                            ]}
+                          >
+                            <Text
+                              style={[
+                                chipTextoInactivo,
+                                item.categoriaId === cat.id
+                                  ? styles.chipTextActivo
+                                  : null,
+                              ]}
+                            >
+                              {cat.nombre}
+                            </Text>
+                          </TouchableOpacity>
+                        ))}
+                      </ScrollView>
+                      <ScrollView
+                        horizontal
+                        showsHorizontalScrollIndicator={false}
+                        contentContainerStyle={styles.chipRow}
+                        style={styles.chipScroll}
+                      >
+                        {etiquetaOptions.map((tag) => (
+                          <TouchableOpacity
+                            key={tag.id}
+                            accessibilityRole="button"
+                            onPress={() =>
+                              setItemEdits((prev) =>
+                                prev.map((it, i) => {
+                                  const ids = it.etiquetaIds ?? [];
+                                  const newIds = ids.includes(tag.id)
+                                    ? ids.filter((id) => id !== tag.id)
+                                    : [...ids, tag.id];
+                                  return i === idx
+                                    ? { ...it, etiquetaIds: newIds }
+                                    : it;
+                                })
+                              )
+                            }
+                            style={[
+                              chipInactivo,
+                              (item.etiquetaIds ?? []).includes(tag.id) &&
+                                styles.chipActivo,
+                            ]}
+                          >
+                            <Text
+                              style={[
+                                chipTextoInactivo,
+                                (item.etiquetaIds ?? []).includes(tag.id)
+                                  ? styles.chipTextActivo
+                                  : null,
+                              ]}
+                            >
+                              #{tag.nombre}
+                            </Text>
+                          </TouchableOpacity>
+                        ))}
+                      </ScrollView>
+                      <TouchableOpacity
+                        accessibilityRole="button"
+                        onPress={() =>
+                          setItemEdits((prev) => prev.filter((_, i) => i !== idx))
+                        }
+                        style={eliminarItemStyle}
+                      >
+                        <Text style={eliminarItemTextStyle}>Eliminar artículo</Text>
+
+
+                      </TouchableOpacity>
+                    </View>
+                  ))}
+                  <TouchableOpacity
+                    accessibilityRole="button"
+                    onPress={() =>
+                      setItemEdits((prev) => [
+                        ...prev,
+                        {
+                          id: Date.now(),
+                          producto: '',
+                          precio: '',
+                          categoriaId: null,
+                          subcategoriaId: null,
+                          etiquetaIds: [],
+                        },
+                      ])
+                    }
+                    style={styles.agregarItemButton}
+                  >
+                    <Text style={styles.agregarItemText}>＋ Agregar artículo</Text>
+                  </TouchableOpacity>
+                </>
+              ) : null}
+
+              {eSaving ? (
+                <Text
+                  style={styles.error}
+                  lightColor="#b91c1c"
+                  darkColor="#fca5a5"
+                >
+                  {eSaving}
+                </Text>
+              ) : null}
+
+              <View
+                style={styles.nameActions}
+                lightColor="transparent"
+                darkColor="transparent"
+              >
+                <TouchableOpacity
+                  accessibilityRole="button"
+                  onPress={() => void guardarEdicion()}
+                  disabled={eSaving !== ''}
+                  style={styles.confirmButton}
+                >
+                  <Text style={styles.confirmText}>
+                    {eSaving ? 'Guardando...' : 'Guardar'}
+                  </Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  accessibilityRole="button"
+                  onPress={() => {
+                    setEditOpen(false);
+                    setESaving('');
+                  }}
+                  disabled={eSaving !== ''}
+                  style={styles.cancelButton}
+                >
+                  <Text style={styles.cancelText}>Cancelar</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+            </ScrollView>
+            </View>
+          </TouchableOpacity>
+        </TouchableOpacity>
+      </Modal>
     </ScrollView>
   );
 }
 
-function Detail({ label, value }: { label: string; value: string | null }) {
+function Detail({ label, value, fullWidth = false }: { label: string; value: string | null; fullWidth?: boolean }) {
   if (!value) return null;
   return (
-    <View style={styles.detail} lightColor="transparent" darkColor="transparent">
+    <View style={[styles.detail, fullWidth && { width: '100%', minWidth: '100%' }]} lightColor="transparent" darkColor="transparent">
       <Text style={styles.detailLabel} lightColor="#6b7280" darkColor="#9ca3af">
         {label}
       </Text>
-      <Text style={styles.detailValue}>{value}</Text>
+      <Text style={styles.detailValue} lightColor="#111827" darkColor="#f9fafb">{value}</Text>
     </View>
   );
 }
@@ -778,6 +1867,11 @@ const styles = StyleSheet.create({
     fontSize: 15,
     textAlign: 'center',
   },
+  cardActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
   retryButton: {
     paddingVertical: 8,
     paddingHorizontal: 12,
@@ -785,5 +1879,159 @@ const styles = StyleSheet.create({
   retryText: {
     color: '#4f46e5',
     fontWeight: '600',
+  },
+  editButton: {
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#c7d2fe',
+    backgroundColor: '#e0e7ff',
+  },
+  itemEditCard: {
+    borderWidth: 1,
+    borderRadius: 10,
+    padding: 10,
+    marginBottom: 8,
+  },
+  miniBotonEliminar: {
+    alignSelf: 'flex-start',
+    paddingVertical: 4,
+    paddingHorizontal: 14,
+    borderRadius: 8,
+    marginTop: 6,
+  },
+  miniBotonEliminarText: {
+    fontWeight: '600',
+    fontSize: 12,
+  },
+  agregarItemButton: {
+    alignItems: 'center',
+    paddingVertical: 10,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#c7d2fe',
+    backgroundColor: '#e0e7ff',
+    marginTop: 4,
+  },
+  agregarItemText: {
+    color: '#4338ca',
+    fontWeight: '600',
+  },
+  editButtonText: {
+    color: '#4338ca',
+    fontWeight: '600',
+    fontSize: 12,
+  },
+  modalBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(2, 6, 23, 0.6)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 24,
+  },
+  modalCard: {
+    width: '100%',
+    borderRadius: 18,
+    padding: 24,
+    elevation: 8,
+    shadowColor: '#000000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.2,
+    shadowRadius: 16,
+  },
+  modalTitle: {
+    fontSize: 20,
+    fontWeight: '600',
+    textAlign: 'center',
+    marginBottom: 8,
+  },
+  modalSub: {
+    fontSize: 13,
+    textAlign: 'center',
+    marginBottom: 12,
+  },
+  nameActions: {
+    flexDirection: 'row',
+    justifyContent: 'center',
+    gap: 12,
+    marginTop: 8,
+  },
+  confirmButton: {
+    paddingVertical: 8,
+    paddingHorizontal: 18,
+    borderRadius: 10,
+    backgroundColor: '#4f46e5',
+  },
+  confirmText: {
+    color: '#ffffff',
+    fontWeight: '600',
+  },
+  cancelButton: {
+    paddingVertical: 8,
+    paddingHorizontal: 18,
+    borderRadius: 10,
+  },
+  cancelText: {
+    fontWeight: '600',
+  },
+  chipRow: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  chipScroll: {
+    flexGrow: 0,
+    marginBottom: 8,
+  },
+  chip: {
+    paddingVertical: 7,
+    paddingHorizontal: 12,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: '#c7d2fe',
+    backgroundColor: '#e0e7ff',
+  },
+  chipActivo: {
+    backgroundColor: '#4f46e5',
+    borderColor: '#4f46e5',
+  },
+  chipText: {
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  chipTextActivo: {
+    color: '#ffffff',
+  },
+  toggleContainer: {
+    flexDirection: 'row',
+    marginBottom: 16,
+    backgroundColor: '#374151',
+    borderRadius: 8,
+    padding: 4,
+  },
+  toggleButton: {
+    flex: 1,
+    paddingVertical: 8,
+    alignItems: 'center',
+    borderRadius: 6,
+  },
+  toggleButtonActive: {
+    backgroundColor: '#4f46e5',
+  },
+  toggleText: {
+    color: '#9ca3af',
+  },
+  toggleTextActive: {
+    color: '#ffffff',
+    fontWeight: '600',
+  },
+  fechaText: {
+    fontSize: 15,
+  },
+  labelMini: {
+    fontSize: 12,
+    fontWeight: '600',
+    marginTop: 4,
+    marginBottom: 6,
   },
 });

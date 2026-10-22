@@ -6,7 +6,7 @@ from pydantic import ValidationError
 
 from app.api.dependencies import get_supabase_client
 from app.schemas.boleta import BoletaConfirmada
-from app.services.boletas import extraer_datos_con_gemini
+from app.services.boletas import extraer_datos_boleta
 
 router = APIRouter(prefix="/gastos", tags=["Gastos"])
 logger = logging.getLogger(__name__)
@@ -37,7 +37,7 @@ async def procesar_boleta(
                 detail="La imagen seleccionada está vacía.",
             )
 
-        datos = await extraer_datos_con_gemini(image_bytes, file.content_type)
+        datos = await extraer_datos_boleta(image_bytes, file.content_type)
         return {"datos_extraidos": datos.model_dump(mode="json")}
     except ValidationError as exc:
         raise HTTPException(
@@ -46,6 +46,12 @@ async def procesar_boleta(
         ) from exc
     except HTTPException:
         raise
+    except RuntimeError as exc:
+        # Mensajes controlados del proveedor IA (límites, clave inválida)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
     except Exception as exc:
         if "503" in str(exc) or "UNAVAILABLE" in str(exc):
             raise HTTPException(
