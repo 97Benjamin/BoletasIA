@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
-  Alert,
   Modal,
   Platform,
   ScrollView,
@@ -18,12 +17,16 @@ import { Redirect } from 'expo-router';
 import { Text, View } from '@/components/Themed';
 import { useThemeMode } from '@/components/ThemeMode';
 import { supabase } from '@/src/services/supabase';
+import { notificarCambio, usePulsoDatos } from '@/src/utils/cambios';
+import { confirmar } from '@/src/utils/confirmar';
 import { formatChileanPesos } from '@/src/utils/currency';
+import { formatearMontoEnEntrada, limpiarMontoParaEstado } from '@/src/utils/moneda-formato';
+import { iconoNormalizado, textoEtiqueta } from '@/src/utils/etiqueta';
 
-type CuentaOpt = { id: number; nombre: string };
+type CuentaOpt = { id: number; nombre: string; tipo: string | null; banco: string | null };
 type CategoriaOpt = { id: number; nombre: string };
 type SubcatOpt = { id: number; nombre: string; categoryId: number };
-type EtiquetaOpt = { id: number; nombre: string };
+type EtiquetaOpt = { id: number; nombre: string; icono?: string | null };
 
 type Recurrente = {
   id: number;
@@ -145,13 +148,17 @@ export default function IngresosGastosScreen() {
   const [recurrentesLoading, setRecurrentesLoading] = useState(false);
   const [recurrentesReload, setRecurrentesReload] = useState(0);
   const [listaError, setListaError] = useState('');
+  // Pulso global: re-carga catálogos cuando Mi cuenta edita categorías o
+  // etiquetas y cuando esta pantalla vuelve a tomar foco.
+  const pulsoDatos = usePulsoDatos();
 
-  // Formulario rápido (gasto sin boleta / ingreso adicional)
-  const [qTipo, setQTipo] = useState<'gasto' | 'ingreso'>('gasto');
+  // Formulario rápido (gasto sin boleta / ingreso adicional / transferencia)
+  const [qTipo, setQTipo] = useState<'gasto' | 'ingreso' | 'transferencia'>('gasto');
   const [qNombre, setQNombre] = useState('');
   const [qMonto, setQMonto] = useState('');
   const [qFecha, setQFecha] = useState(formatFecha(new Date()));
   const [qCuentaId, setCuentaId] = useState<number | null>(null);
+  const [qCuentaDestinoId, setCuentaDestinoId] = useState<number | null>(null);
   const [qCategoriaId, setQCategoriaId] = useState<number | null>(null);
   const [qSubcatId, setQSubcatId] = useState<number | null>(null);
   const [qTagIds, setQTagIds] = useState<number[]>([]);
@@ -225,7 +232,7 @@ export default function IngresosGastosScreen() {
         await Promise.all([
           supabase
             .from('cuentas')
-            .select('id, nombre')
+            .select('id, nombre, tipo, banco')
             .eq('user_id', userId)
             .order('nombre'),
           supabase
@@ -235,12 +242,11 @@ export default function IngresosGastosScreen() {
             .order('nombre'),
           supabase
             .from('subcategorias')
-            .select('id, nombre, categoria_id, user_id')
-            .or(`user_id.is.null,user_id.eq.${userId}`)
+            .select('id, nombre, categoria_id')
             .order('nombre'),
           supabase
             .from('etiquetas')
-            .select('id, nombre, user_id')
+            .select('id, nombre, icono, user_id')
             .or(`user_id.is.null,user_id.eq.${userId}`)
             .order('nombre'),
         ]);
@@ -255,7 +261,30 @@ export default function IngresosGastosScreen() {
             return { id, nombre: nombre.trim() };
           })
           .filter((item): item is { id: number; nombre: string } => item !== null);
-      const cuentaList = mapSimple(cuentaResult.data ?? [], cuentaResult);
+      const cuentaList = (cuentaResult.data ?? []).flatMap(
+        (row): CuentaOpt[] => {
+          const record = row as {
+            id: unknown;
+            nombre: unknown;
+            tipo: unknown;
+            banco: unknown;
+          };
+          if (
+            typeof record.id !== 'number' ||
+            typeof record.nombre !== 'string'
+          ) {
+            return [];
+          }
+          return [
+            {
+              id: record.id,
+              nombre: record.nombre.trim(),
+              tipo: typeof record.tipo === 'string' ? record.tipo : null,
+              banco: typeof record.banco === 'string' ? record.banco.trim() || null : null,
+            },
+          ];
+        }
+      );
       setCuentaOptions(cuentaList);
       // Toda transacción requiere cuenta: deja la primera por defecto.
       setCuentaId((previa) => previa ?? cuentaList[0]?.id ?? null);
@@ -288,14 +317,36 @@ export default function IngresosGastosScreen() {
           ];
         })
       );
-      setEtiquetaOptions(mapSimple(tagResult.data ?? [], tagResult));
+      const etiquetasCargadas = (tagResult.data ?? []).flatMap(
+        (row): EtiquetaOpt[] => {
+          const record = row as {
+            id: unknown;
+            nombre: unknown;
+            icono: unknown;
+          };
+          if (
+            typeof record?.id !== 'number' ||
+            typeof record?.nombre !== 'string'
+          ) {
+            return [];
+          }
+          return [
+            {
+              id: record.id,
+              nombre: record.nombre.trim(),
+              icono: iconoNormalizado(record.icono),
+            },
+          ];
+        }
+      );
+      setEtiquetaOptions(etiquetasCargadas);
     }
 
     void loadCatalog();
     return () => {
       isMounted = false;
     };
-  }, [user?.id]);
+  }, [user?.id, pulsoDatos]);
 
   useEffect(() => {
     const userId = user?.id;
@@ -374,7 +425,7 @@ export default function IngresosGastosScreen() {
     return () => {
       isMounted = false;
     };
-  }, [user?.id, recurrentesReload]);
+  }, [user?.id, recurrentesReload, pulsoDatos]);
 
   const hoy = new Date();
   const pendientes = recurrentes
@@ -433,7 +484,7 @@ export default function IngresosGastosScreen() {
 
   async function confirmarPendiente() {
     if (!user || !pendiente || pSaving) return;
-    const monto = inputAmount(pMonto);
+    const monto = inputAmount(limpiarMontoParaEstado(pMonto));
     if (monto === null) {
       setError('Escribe un monto válido para el registro.');
       return;
@@ -482,6 +533,8 @@ export default function IngresosGastosScreen() {
       );
       setPendiente(null);
       setRecurrentesReload((value) => value + 1);
+      // Transacción nueva: Movimientos y Presupuestos deben recalcular.
+      notificarCambio();
     } catch (saveError: unknown) {
       setError(
         `No se pudo registrar: ${
@@ -551,7 +604,7 @@ export default function IngresosGastosScreen() {
   async function guardarRecurrente() {
     if (!user || rSaving) return;
     const nombre = rNombre.trim();
-    const monto = inputAmount(rMonto);
+    const monto = inputAmount(limpiarMontoParaEstado(rMonto));
     if (!nombre) {
       setError('Escribe un nombre para el recurrente (ej: Sueldo, Arriendo).');
       return;
@@ -623,31 +676,24 @@ export default function IngresosGastosScreen() {
   }
 
   function eliminarRecurrente(rec: Recurrente) {
-    Alert.alert(
+    confirmar(
       'Eliminar recurrente',
       `¿Eliminar "${rec.nombre}"? Esta acción no se puede deshacer.`,
-      [
-        { text: 'Cancelar', style: 'cancel' },
-        {
-          text: 'Eliminar',
-          style: 'destructive',
-          onPress: () => {
-            void (async () => {
-              const { error: deleteError } = await supabase
-                .from('recurrentes')
-                .delete()
-                .eq('id', rec.id);
-              if (deleteError) {
-                setError(
-                  `No se pudo eliminar: ${deleteError.message}`
-                );
-                return;
-              }
-              setRecurrentesReload((value) => value + 1);
-            })();
-          },
-        },
-      ]
+      () => {
+        void (async () => {
+          const { error: deleteError } = await supabase
+            .from('recurrentes')
+            .delete()
+            .eq('id', rec.id);
+          if (deleteError) {
+            setError(
+              `No se pudo eliminar: ${deleteError.message}`
+            );
+            return;
+          }
+          setRecurrentesReload((value) => value + 1);
+        })();
+      }
     );
   }
 
@@ -669,55 +715,132 @@ export default function IngresosGastosScreen() {
   async function enviarRapido() {
     if (!user || qSaving) return;
     const nombre = qNombre.trim();
-    const monto = inputAmount(qMonto);
-    if (!nombre) {
-      setError('Escribe un nombre (ej: "Farmacia", "Sueldo freelance").');
-      return;
-    }
+    const monto = inputAmount(limpiarMontoParaEstado(qMonto));
+    const esTransferencia = qTipo === 'transferencia';
     if (monto === null) {
       setError('Escribe un monto válido mayor que cero.');
       return;
     }
-    if (qSubcatId !== null && qCategoriaId === null) {
+    if (!esTransferencia && !nombre) {
+      setError('Escribe un nombre (ej: "Farmacia", "Sueldo freelance").');
+      return;
+    }
+    if (!esTransferencia && qSubcatId !== null && qCategoriaId === null) {
       setError('Para subcategoría primero elige una categoría.');
       return;
     }
-    if (qCuentaId === null) {
+    if (!esTransferencia && qCuentaId === null) {
       setError(
         'Elige la cuenta asociada (crea una en "Mi cuenta" si aún no tienes).'
       );
       return;
     }
+    if (esTransferencia) {
+      if (qCuentaId === null || qCuentaDestinoId === null) {
+        setError('Elige la cuenta de origen y la cuenta de destino.');
+        return;
+      }
+      if (qCuentaId === qCuentaDestinoId) {
+        setError('La cuenta de origen y la de destino deben ser distintas.');
+        return;
+      }
+    }
     setQSaving(true);
     setError('');
     setMessage('');
     try {
-      const comercioId = await resolverComercio(qNombre);
-      const { data, error: insertError } = await supabase
-        .from('transacciones')
-        .insert({
-          user_id: user.id,
-          cuenta_id: qCuentaId,
-          comercio_id: comercioId,
-          categoria_id: qCategoriaId,
-          subcategoria_id: qCategoriaId === null ? null : qSubcatId,
-          tipo: qTipo,
-          fecha: qFecha,
-          total: String(monto),
-        })
-        .select('id');
-      if (insertError) throw insertError;
-      const transaccionId = (data as { id: number }[] | null)?.[0]?.id;
-      if (typeof transaccionId !== 'number') {
-        throw new Error('La base de datos no devolvió la transacción creada.');
+      if (esTransferencia) {
+        const origen = cuentaOptions.find((cuenta) => cuenta.id === qCuentaId);
+        const destino = cuentaOptions.find(
+          (cuenta) => cuenta.id === qCuentaDestinoId
+        );
+        const origenNombre = origen?.nombre ?? 'otra cuenta';
+        const destinoNombre = destino?.nombre ?? 'otra cuenta';
+        // Si el destino es una tarjeta de crédito, el movimiento es el pago de
+        // la tarjeta (baja la deuda/recupera cupo y descuenta la cuenta origen).
+        // Si el origen es la tarjeta, es un avance (sube la deuda).
+        const esPagoTarjeta = destino?.tipo === 'credito';
+        const esAvanceTarjeta = !esPagoTarjeta && origen?.tipo === 'credito';
+        const etiquetaTransferencia = esPagoTarjeta
+          ? `Pago tarjeta · ${destinoNombre}`
+          : esAvanceTarjeta
+            ? `Avance tarjeta · ${origenNombre}`
+            : `Transferencia ${origenNombre} → ${destinoNombre}`;
+        // Par simétrico gasto(sale)+ingreso(llega): el trigger trg_transacciones_saldo
+        // mueve ambos saldos y el Resumen netea a cero (no es gasto ni ganancia real).
+        const comercioId = await resolverComercio(etiquetaTransferencia);
+        const { error: salidaError } = await supabase
+          .from('transacciones')
+          .insert({
+            user_id: user.id,
+            cuenta_id: qCuentaId,
+            comercio_id: comercioId,
+            categoria_id: null,
+            subcategoria_id: null,
+            tipo: 'gasto',
+            fecha: qFecha,
+            total: String(monto),
+          })
+          .select('id');
+        if (salidaError) throw salidaError;
+        const { error: llegadaError } = await supabase
+          .from('transacciones')
+          .insert({
+            user_id: user.id,
+            cuenta_id: qCuentaDestinoId,
+            comercio_id: comercioId,
+            categoria_id: null,
+            subcategoria_id: null,
+            tipo: 'ingreso',
+            fecha: qFecha,
+            total: String(monto),
+          })
+          .select('id');
+        if (llegadaError) throw llegadaError;
+        setMessage(
+          esPagoTarjeta
+            ? `Pago de ${formatChileanPesos(
+                monto
+              )} a la tarjeta ${destinoNombre} registrado. Recuperaste ese cupo.`
+            : esAvanceTarjeta
+              ? `Avance de ${formatChileanPesos(
+                  monto
+                )} desde la tarjeta ${origenNombre} registrado.`
+              : `Transferencia de ${formatChileanPesos(
+                  monto
+                )} desde ${origenNombre} hacia ${destinoNombre} registrada.`
+        );
+      } else {
+        const comercioId = await resolverComercio(qNombre);
+        const { data, error: insertError } = await supabase
+          .from('transacciones')
+          .insert({
+            user_id: user.id,
+            cuenta_id: qCuentaId,
+            comercio_id: comercioId,
+            categoria_id: qCategoriaId,
+            subcategoria_id: qCategoriaId === null ? null : qSubcatId,
+            tipo: qTipo,
+            fecha: qFecha,
+            total: String(monto),
+          })
+          .select('id');
+        if (insertError) throw insertError;
+        const transaccionId = (data as { id: number }[] | null)?.[0]?.id;
+        if (typeof transaccionId !== 'number') {
+          throw new Error('La base de datos no devolvió la transacción creada.');
+        }
+        await guardarEtiquetas(transaccionId, qTagIds);
+        setMessage(
+          `${qTipo === 'gasto' ? 'Gasto' : 'Ingreso'} registrado por ${formatChileanPesos(monto)}.`
+        );
       }
-      await guardarEtiquetas(transaccionId, qTagIds);
-      setMessage(
-        `${qTipo === 'gasto' ? 'Gasto' : 'Ingreso'} registrado por ${formatChileanPesos(monto)}.`
-      );
       setQNombre('');
       setQMonto('');
       setQFecha(formatFecha(new Date()));
+      // Gasto/ingreso/transferencia nueva: Movimientos y Presupuestos
+      // deben recalcularse sin recargar la página.
+      notificarCambio();
     } catch (saveError: unknown) {
       setError(
         `No se pudo registrar: ${
@@ -844,11 +967,22 @@ export default function IngresosGastosScreen() {
           lightColor="transparent"
           darkColor="transparent"
         >
-          {(['gasto', 'ingreso'] as const).map((tipoOpcion) => (
+          {(['gasto', 'ingreso', 'transferencia'] as const).map((tipoOpcion) => (
             <TouchableOpacity
               key={tipoOpcion}
               accessibilityRole="button"
-              onPress={() => setQTipo(tipoOpcion)}
+              onPress={() => {
+                setQTipo(tipoOpcion);
+                if (tipoOpcion === 'transferencia') {
+                  // Preselección cómoda: una cuenta distinta a la de origen
+                  setCuentaDestinoId(
+                    (previa) =>
+                      previa ??
+                      cuentaOptions.find((cuenta) => cuenta.id !== qCuentaId)?.id ??
+                      null
+                  );
+                }
+              }}
               style={[chipInactivo, qTipo === tipoOpcion && styles.chipActivo]}
             >
               <Text
@@ -857,24 +991,33 @@ export default function IngresosGastosScreen() {
                   qTipo === tipoOpcion ? styles.chipTextActivo : null,
                 ]}
               >
-                {tipoOpcion === 'gasto' ? '⬇️ Gasto' : '⬆️ Ingreso'}
+                {tipoOpcion === 'gasto'
+                  ? '⬇️ Gasto'
+                  : tipoOpcion === 'ingreso'
+                    ? '⬆️ Ingreso'
+                    : '🔁 Transferencia'}
               </Text>
             </TouchableOpacity>
           ))}
         </View>
 
-        <TextInput
-          style={inputStyle}
-          value={qNombre}
-          onChangeText={setQNombre}
-          placeholder="Descripción (ej: Farmacia, Sueldo freelance)"
-          placeholderTextColor={colorScheme === 'dark' ? '#9ca3af' : '#6b7280'}
-          autoCapitalize="sentences"
-        />
+        {qTipo !== 'transferencia' ? (
+          <TextInput
+            style={inputStyle}
+            value={qNombre}
+            onChangeText={setQNombre}
+            placeholder="Descripción (ej: Farmacia, Sueldo freelance)"
+            placeholderTextColor={colorScheme === 'dark' ? '#9ca3af' : '#6b7280'}
+            autoCapitalize="sentences"
+          />
+        ) : null}
         <TextInput
           style={inputStyle}
           value={qMonto}
-          onChangeText={setQMonto}
+          onChangeText={(texto) => {
+            const formateado = formatearMontoEnEntrada(texto);
+            setQMonto(formateado);
+          }}
           placeholder="Monto (ej: 12.990)"
           placeholderTextColor={colorScheme === 'dark' ? '#9ca3af' : '#6b7280'}
           keyboardType={Platform.OS === 'web' ? 'default' : 'numeric'}
@@ -892,34 +1035,100 @@ export default function IngresosGastosScreen() {
           bloquearFuturo
         />
 
-        <Text style={styles.labelMini} lightColor="#6b7280" darkColor="#9ca3af">
-          Cuenta
-        </Text>
-        <ScrollView
-          horizontal
-          showsHorizontalScrollIndicator={false}
-          contentContainerStyle={styles.chipRow}
-          style={styles.chipScroll}
-        >
-          {cuentaOptions.map((cuenta) => (
-            <TouchableOpacity
-              key={cuenta.id}
-              accessibilityRole="button"
-              onPress={() => setCuentaId(cuenta.id)}
-              style={[chipInactivo, qCuentaId === cuenta.id && styles.chipActivo]}
+        {qTipo === 'transferencia' ? (
+          <>
+            <Text style={styles.labelMini} lightColor="#6b7280" darkColor="#9ca3af">
+              Cuenta origen (sale el dinero)
+            </Text>
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              contentContainerStyle={styles.chipRow}
+              style={styles.chipScroll}
             >
-              <Text
-                style={[
-                  chipTextoInactivo,
-                  qCuentaId === cuenta.id ? styles.chipTextActivo : null,
-                ]}
-              >
-                {cuenta.nombre}
-              </Text>
-            </TouchableOpacity>
-          ))}
-        </ScrollView>
+              {cuentaOptions.map((cuenta) => (
+                <TouchableOpacity
+                  key={cuenta.id}
+                  accessibilityRole="button"
+                  onPress={() => setCuentaId(cuenta.id)}
+                  style={[chipInactivo, qCuentaId === cuenta.id && styles.chipActivo]}
+                >
+                  <Text
+                    style={[
+                      chipTextoInactivo,
+                      qCuentaId === cuenta.id ? styles.chipTextActivo : null,
+                    ]}
+                  >
+                    {cuenta.banco ? `${cuenta.nombre} · ${cuenta.banco}` : cuenta.nombre}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </ScrollView>
+            <Text style={styles.labelMini} lightColor="#6b7280" darkColor="#9ca3af">
+              Cuenta destino (llega el dinero)
+            </Text>
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              contentContainerStyle={styles.chipRow}
+              style={styles.chipScroll}
+            >
+              {cuentaOptions.map((cuenta) => (
+                <TouchableOpacity
+                  key={cuenta.id}
+                  accessibilityRole="button"
+                  onPress={() => setCuentaDestinoId(cuenta.id)}
+                  style={[
+                    chipInactivo,
+                    qCuentaDestinoId === cuenta.id && styles.chipActivo,
+                  ]}
+                >
+                  <Text
+                    style={[
+                      chipTextoInactivo,
+                      qCuentaDestinoId === cuenta.id ? styles.chipTextActivo : null,
+                    ]}
+                  >
+                    {cuenta.nombre}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </ScrollView>
+          </>
+        ) : (
+          <>
+            <Text style={styles.labelMini} lightColor="#6b7280" darkColor="#9ca3af">
+              Cuenta
+            </Text>
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              contentContainerStyle={styles.chipRow}
+              style={styles.chipScroll}
+            >
+              {cuentaOptions.map((cuenta) => (
+                <TouchableOpacity
+                  key={cuenta.id}
+                  accessibilityRole="button"
+                  onPress={() => setCuentaId(cuenta.id)}
+                  style={[chipInactivo, qCuentaId === cuenta.id && styles.chipActivo]}
+                >
+                  <Text
+                    style={[
+                      chipTextoInactivo,
+                      qCuentaId === cuenta.id ? styles.chipTextActivo : null,
+                    ]}
+                  >
+                    {cuenta.banco ? `${cuenta.nombre} · ${cuenta.banco}` : cuenta.nombre}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </ScrollView>
+          </>
+        )}
 
+        {qTipo !== 'transferencia' ? (
+          <>
         <Text style={styles.labelMini} lightColor="#6b7280" darkColor="#9ca3af">
           Categoría
         </Text>
@@ -1043,11 +1252,13 @@ export default function IngresosGastosScreen() {
                         : null,
                     ]}
                   >
-                    #{etiqueta.nombre}
+                    {textoEtiqueta(etiqueta)}
                   </Text>
                 </TouchableOpacity>
               ))}
             </ScrollView>
+          </>
+        ) : null}
           </>
         ) : null}
 
@@ -1238,7 +1449,7 @@ export default function IngresosGastosScreen() {
                   <TextInput
                     style={inputStyle}
                     value={pMonto}
-                    onChangeText={setPMonto}
+                    onChangeText={(texto) => setPMonto(formatearMontoEnEntrada(texto))}
                     placeholder="Monto real"
                     placeholderTextColor={
                       colorScheme === 'dark' ? '#9ca3af' : '#6b7280'
@@ -1362,7 +1573,7 @@ export default function IngresosGastosScreen() {
               <TextInput
                 style={inputStyle}
                 value={rMonto}
-                onChangeText={setRMonto}
+                onChangeText={(texto) => setRMonto(formatearMontoEnEntrada(texto))}
                 placeholder="Monto base (ej: 950.000)"
                 placeholderTextColor={colorScheme === 'dark' ? '#9ca3af' : '#6b7280'}
                 keyboardType={Platform.OS === 'web' ? 'default' : 'numeric'}
@@ -1398,7 +1609,7 @@ export default function IngresosGastosScreen() {
                         rCuentaId === cuenta.id ? styles.chipTextActivo : null,
                       ]}
                     >
-                      {cuenta.nombre}
+                      {cuenta.banco ? `${cuenta.nombre} · ${cuenta.banco}` : cuenta.nombre}
                     </Text>
                   </TouchableOpacity>
                 ))}
@@ -1537,7 +1748,7 @@ export default function IngresosGastosScreen() {
                               : null,
                           ]}
                         >
-                          #{etiqueta.nombre}
+                          {textoEtiqueta(etiqueta)}
                         </Text>
                       </TouchableOpacity>
                     ))}

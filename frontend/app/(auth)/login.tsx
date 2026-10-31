@@ -145,7 +145,7 @@ export default function AuthScreen() {
               <Text style={styles.primaryButtonText}>Iniciar Sesión</Text>
             </TouchableOpacity>
 
-            <TouchableOpacity style={styles.secondaryButton} onPress={handleSignUp}>
+            <TouchableOpacity style={styles.secondaryButton} onPress={() => router.push('/(auth)/register')}>
               <Text style={styles.secondaryButtonText}>Registrarse</Text>
             </TouchableOpacity>
           </View>

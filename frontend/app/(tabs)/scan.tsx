@@ -10,15 +10,17 @@ import {
 } from 'react-native';
 import type { ImagePickerAsset } from 'expo-image-picker';
 import * as ImagePicker from 'expo-image-picker';
+import { formatearMontoEnEntrada, limpiarMontoParaEstado } from '@/src/utils/moneda-formato';
 import { File, UploadType } from 'expo-file-system';
 
 import { Text, View } from '@/components/Themed';
 import { useThemeMode } from '@/components/ThemeMode';
 import SelectorFecha from '@/components/SelectorFecha';
 import { supabase } from '@/src/services/supabase';
+import { notificarCambio } from '@/src/utils/cambios';
 import { formatChileanPesos } from '@/src/utils/currency';
 
-type SelectOption = { id: number; name: string };
+type SelectOption = { id: number; name: string; icono?: string | null };
 type SubcategoryOption = SelectOption & { categoryId: number };
 type AccountOption = SelectOption & { type: string; bank: string | null };
 type ExtractedItem = {
@@ -64,7 +66,9 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 function readOptions(
   value: unknown,
   nameField: string
-): Array<SelectOption & { categoryId?: number; type?: string; bank?: string | null }> {
+): Array<
+  SelectOption & { categoryId?: number; type?: string; bank?: string | null }
+> {
   if (!Array.isArray(value)) return [];
   return value.flatMap((entry) => {
     const row = asRecord(entry);
@@ -82,6 +86,9 @@ function readOptions(
       {
         id,
         name: name.trim(),
+        ...(typeof row.icono === 'string' && row.icono.trim()
+          ? { icono: row.icono.trim() }
+          : {}),
         ...(typeof row.categoria_id === 'number'
           ? { categoryId: row.categoria_id }
           : {}),
@@ -347,7 +354,7 @@ export default function ScanReceiptScreen() {
         supabase.from('subcategorias').select('id, nombre, categoria_id').order('nombre'),
         supabase
           .from('etiquetas')
-          .select('id, nombre')
+          .select('id, nombre, icono')
           .eq('user_id', userId)
           .order('nombre'),
       ]);
@@ -578,6 +585,8 @@ export default function ScanReceiptScreen() {
         subcategoryId: String(createdSubcategory.id),
         newSubcategoryName: '',
       });
+      // Los demás tabs muestran subcategorías en sus chips y selects.
+      notificarCambio();
     } catch (createError: unknown) {
       setError(
         createError instanceof Error
@@ -653,6 +662,8 @@ export default function ScanReceiptScreen() {
         tagIds: [...item.tagIds, createdTag.id],
         newTagName: '',
       });
+      // Los demás tabs muestran etiquetas con icono en sus chips.
+      notificarCambio();
     } catch (createError: unknown) {
       setError(
         createError instanceof Error
@@ -666,7 +677,7 @@ export default function ScanReceiptScreen() {
 
   async function confirmReceipt() {
     if (!review || creatingOption) return;
-    const parsedTotal = inputAmount(review.total);
+    const parsedTotal = inputAmount(limpiarMontoParaEstado(review.total));
     if (!review.merchant.trim()) {
       setError('Ingresa el nombre del comercio.');
       return;
@@ -685,7 +696,7 @@ export default function ScanReceiptScreen() {
     }
     const items = review.items.map((item) => ({
       producto: item.product.trim(),
-      precio: inputAmount(item.price),
+      precio: inputAmount(limpiarMontoParaEstado(item.price)),
       categoria_id: item.categoryId ? Number(item.categoryId) : null,
       subcategoria_id: item.subcategoryId ? Number(item.subcategoryId) : null,
       etiqueta_ids: item.tagIds,
@@ -750,6 +761,9 @@ export default function ScanReceiptScreen() {
       });
       setReview(null);
       setImage(null);
+      // Gasto guardado: Movimientos, Rápidos y Presupuestos deben recalcular
+      // sin recargar la página.
+      notificarCambio();
     } catch (saveError: unknown) {
       setError(
         saveError instanceof Error
@@ -895,7 +909,7 @@ export default function ScanReceiptScreen() {
           <TextInput
             accessibilityLabel="Total de la boleta"
             value={review.total}
-            onChangeText={(total) => patchReview({ total })}
+            onChangeText={(total) => patchReview({ total: formatearMontoEnEntrada(total) })}
             keyboardType="decimal-pad"
             style={textInputStyle(isDark)}
           />
@@ -976,7 +990,7 @@ export default function ScanReceiptScreen() {
                 <TextInput
                   accessibilityLabel={`Precio del artículo ${index + 1}`}
                   value={item.price}
-                  onChangeText={(price) => patchItem(index, { price })}
+                  onChangeText={(price) => patchItem(index, { price: formatearMontoEnEntrada(price) })}
                   keyboardType="decimal-pad"
                   style={textInputStyle(isDark)}
                 />
@@ -1258,7 +1272,7 @@ function ChoiceList({
               darkColor={selected ? '#c7d2fe' : '#e5e7eb'}
             >
               {multiple && selected ? '✓ ' : ''}
-              {option.name}
+              {option.icono ? `${option.icono} ${option.name}` : option.name}
             </Text>
           </TouchableOpacity>
         );

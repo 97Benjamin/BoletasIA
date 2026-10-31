@@ -83,20 +83,35 @@ def _construir_contexto(supabase, user_id: str) -> str:
 
     cuentas = (
         supabase.table("cuentas")
-        .select("id,nombre,tipo,banco,saldo_actual")
+        .select("id,nombre,tipo,banco,saldo_actual,cupo,dia_corte,dia_pago")
         .eq("user_id", user_id)
         .execute()
     ).data or []
 
     if cuentas:
-        lineas = ["CUENTAS (saldo disponible):"]
+        lineas = ["CUENTAS:"]
         for cuenta in cuentas:
             banco = _texto(cuenta.get("banco"))
             tipo = _texto(cuenta.get("tipo")) or "sin tipo"
             detalle = f" [{tipo}{', ' + banco if banco else ''}]"
-            lineas.append(
-                f"- {cuenta.get('nombre')}: {_pesos(cuenta.get('saldo_actual'))}{detalle}"
-            )
+            sal = cuenta.get("saldo_actual")
+            cupo = cuenta.get("cupo")
+            if tipo == "credito" and cupo is not None:
+                disponible = float(sal or 0)
+                cupo_f = float(cupo)
+                deuda = max(cupo_f - disponible, 0)
+                corte = cuenta.get("dia_corte")
+                pago = cuenta.get("dia_pago")
+                ciclo = f" · Corte día {corte}" if corte else ""
+                ciclo += f" · Pago día {pago}" if pago else ""
+                lineas.append(
+                    f"- {cuenta.get('nombre')}: Cupo {_pesos(cupo_f)} · Deuda {_pesos(deuda)} · "
+                    f"Disponible {_pesos(disponible)}{detalle}{ciclo}"
+                )
+            else:
+                lineas.append(
+                    f"- {cuenta.get('nombre')}: {_pesos(sal)}{detalle}"
+                )
         secciones.append("\n".join(lineas))
     else:
         secciones.append("CUENTAS: el usuario aún no tiene cuentas registradas.")
@@ -225,6 +240,26 @@ def _construir_contexto(supabase, user_id: str) -> str:
         )[:10]
     )
     secciones.append("\n".join(resumen))
+
+    # PRESUPUESTOS definidos por el usuario
+    try:
+        presupuestos_raw = (
+            supabase.table("presupuestos")
+            .select("id,nombre,monto_mensual")
+            .eq("user_id", user_id)
+            .execute()
+        ).data or []
+        if presupuestos_raw:
+            lineas_pres = ["PRESUPUESTOS DEL USUARIO:"]
+            for p in presupuestos_raw:
+                nombre_p = _texto(p.get("nombre")) or "Sin nombre"
+                monto_p = float(p.get("monto_mensual") or 0)
+                lineas_pres.append(
+                    f"- {nombre_p}: {_pesos(monto_p)} mensual"
+                )
+            secciones.append("\n".join(lineas_pres))
+    except Exception:
+        pass
 
     return "\n\n".join(secciones)
 

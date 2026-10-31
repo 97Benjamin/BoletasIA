@@ -1,7 +1,6 @@
 import { useEffect, useState, Fragment, useRef } from 'react';
 import {
   ActivityIndicator,
-  Alert,
   Dimensions,
   Modal,
   Platform,
@@ -20,7 +19,10 @@ import { Redirect } from 'expo-router';
 import { Text, View } from '@/components/Themed';
 import { useThemeMode } from '@/components/ThemeMode';
 import { supabase } from '@/src/services/supabase';
+import { notificarCambio, usePulsoDatos } from '@/src/utils/cambios';
+import { confirmar } from '@/src/utils/confirmar';
 import { formatChileanPesos } from '@/src/utils/currency';
+import { iconoNormalizado, textoEtiqueta } from '@/src/utils/etiqueta';
 
 type DatabaseRow = Record<string, unknown>;
 type DatabaseId = string | number;
@@ -63,7 +65,7 @@ type TransactionDetail = {
 type CuentaOpt = { id: number; nombre: string };
 type CategoriaOpt = { id: number; nombre: string };
 type SubcatOpt = { id: number; nombre: string; categoryId: number };
-type EtiquetaOpt = { id: number; nombre: string };
+type EtiquetaOpt = { id: number; nombre: string; icono?: string | null };
 
 function pad2(value: number) {
   return String(value).padStart(2, '0');
@@ -216,7 +218,9 @@ export default function TransactionsScreen() {
 
   // --- Lógica de Resumen Robusta ---
   // 1. Obtener todas las fechas disponibles
-  const todasLasFechas = transactions.map((t) => new Date(t.date).getTime());
+  const todasLasFechas = transactions
+    .map((t) => (t.date ? new Date(t.date).getTime() : Number.NaN))
+    .filter((v) => !Number.isNaN(v));
   const minTime = todasLasFechas.length > 0 ? Math.min(...todasLasFechas) : new Date().getTime();
   const maxTime = new Date().getTime();
   
@@ -238,7 +242,7 @@ export default function TransactionsScreen() {
     // Sumar movimientos de este día específico
     const movsDelDia = transactions.filter(t => t.date === fechaStr);
     movsDelDia.forEach(t => {
-      saldoAcumulado += (t.type === 'ingreso' ? t.total : -t.total);
+      saldoAcumulado += (t.type === 'ingreso' ? (t.total ?? 0) : -(t.total ?? 0));
     });
     
     serieAcumulada.push(saldoAcumulado);
@@ -251,6 +255,21 @@ export default function TransactionsScreen() {
     }
   }
 
+  // Dataset de puntos: valor solo en días con movimiento, null el resto.
+  // En web se apaga del todo porque chart-kit pega onPressIn/onClick a los círculos SVG
+  // (incluso al círculo táctil invisible de radio 14) y react-native-web lanza el warning
+  // "Unknown event handler property onPressIn".
+  const seriePuntos = serieAcumulada.map((val, i) => {
+    const fechaIteracion = new Date(primeraFecha);
+    fechaIteracion.setDate(primeraFecha.getDate() + i);
+    const fechaStr = fechaIteracion.toISOString().split('T')[0];
+    return transactions.some(t => t.date === fechaStr) ? val : null;
+  });
+  // calcHeight(null) devuelve 0 y esos días se pintarían como puntos pegados a la base:
+  // se ocultan por índice (hidePointsAtIndex solo afecta a los puntos, no a la línea).
+  const indicesPuntosVacios: number[] = [];
+  seriePuntos.forEach((val, i) => { if (val === null) indicesPuntosVacios.push(i); });
+
   const dataChart = {
     labels: labels,
     datasets: [
@@ -261,20 +280,21 @@ export default function TransactionsScreen() {
         withDots: false,
       },
       {
-        // Serie secundaria solo para los puntos donde hubo movimiento
-        data: serieAcumulada.map((val, i) => {
-            const fechaIteracion = new Date(primeraFecha);
-            fechaIteracion.setDate(primeraFecha.getDate() + i);
-            const fechaStr = fechaIteracion.toISOString().split('T')[0];
-            return transactions.some(t => t.date === fechaStr) ? val : null;
-        }),
-        withDots: true,
+        // Serie secundaria solo para los puntos donde hubo movimiento.
+        // Los null son placeholders ("sin punto ese día"): el tipo de la librería pide
+        // number[], pero en runtime getValidData() los filtra y hidePointsAtIndex
+        // asegura que no se dibuje nada en esos índices.
+        data: seriePuntos as number[],
+        withDots: Platform.OS !== 'web',
       }
     ],
   };
   const [transactionsLoading, setTransactionsLoading] = useState(false);
   const [error, setError] = useState('');
   const [reload, setReload] = useState(0);
+  // Pulso global: re-carga catálogos y transacciones cuando otra pantalla
+  // (Escanear, Rápidos, Mi cuenta) cambia datos, y al volver al tab.
+  const pulsoDatos = usePulsoDatos();
 
   // Catálogos para editar transacciones
   const [cuentaOptions, setCuentaOptions] = useState<CuentaOpt[]>([]);
@@ -392,12 +412,12 @@ export default function TransactionsScreen() {
             .order('nombre'),
           supabase
             .from('subcategorias')
-            .select('id, nombre, categoria_id, user_id')
-            .or(`user_id.is.null,user_id.eq.${userId}`)
+            // subcategorias no tiene user_id: pertenece a su categoría
+            .select('id, nombre, categoria_id')
             .order('nombre'),
           supabase
             .from('etiquetas')
-            .select('id, nombre, user_id')
+            .select('id, nombre, icono, user_id')
             .or(`user_id.is.null,user_id.eq.${userId}`)
             .order('nombre'),
         ]);
@@ -417,6 +437,29 @@ export default function TransactionsScreen() {
           .filter((item): item is CuentaOpt => item !== null);
       setCuentaOptions(mapSimple(cuentaResult.data ?? []));
       setCategoriaOptions(mapSimple(categoriaResult.data ?? []));
+      const etiquetasCargadas = (tagResult.data ?? []).flatMap(
+        (row): EtiquetaOpt[] => {
+          const record = row as {
+            id: unknown;
+            nombre: unknown;
+            icono: unknown;
+          };
+          if (
+            typeof record?.id !== 'number' ||
+            typeof record?.nombre !== 'string'
+          ) {
+            return [];
+          }
+          return [
+            {
+              id: record.id,
+              nombre: record.nombre.trim(),
+              icono: iconoNormalizado(record.icono),
+            },
+          ];
+        }
+      );
+      setEtiquetaOptions(etiquetasCargadas);
       const subcatRows = (subcatResult.data ?? []) as {
         id: unknown;
         nombre: unknown;
@@ -440,14 +483,13 @@ export default function TransactionsScreen() {
           ];
         })
       );
-      setEtiquetaOptions(mapSimple(tagResult.data ?? []));
     }
 
     void loadCatalog();
     return () => {
       isMounted = false;
     };
-  }, [user?.id]);
+  }, [user?.id, pulsoDatos]);
 
   useEffect(() => {
     const userId = user?.id;
@@ -469,7 +511,10 @@ export default function TransactionsScreen() {
             .from('transacciones')
             .select('*')
             .eq('user_id', userId)
-            .order('fecha', { ascending: false });
+            // Orden por fecha; dentro del mismo día gana la creada más reciente
+            // (con solo .order('fecha') el empate era aleatorio en cada re-fetch)
+            .order('fecha', { ascending: false })
+            .order('creado_en', { ascending: false });
         const transactionRows = rowsOrThrow(
           transactionData,
           transactionError
@@ -709,7 +754,11 @@ export default function TransactionsScreen() {
                 const tag =
                   tagId === null ? null : tagsById.get(String(tagId));
                 const name = tag ? readText(tag, 'nombre') : null;
-                return name ? [name] : [];
+                if (name === null) return [];
+                const icono = iconoNormalizado(
+                  tag ? readText(tag, 'icono') : null
+                );
+                return [icono ? `${icono} ${name}` : `#${name}`];
               }),
             })),
             itemRows: rowItems.map((item) => ({
@@ -735,7 +784,11 @@ export default function TransactionsScreen() {
               if (tagId === null) return [];
               const tag = tagsById.get(String(tagId));
               const name = tag ? readText(tag, 'nombre') : null;
-              return name ? [name] : [];
+              if (name === null) return [];
+              const icono = iconoNormalizado(
+                tag ? readText(tag, 'icono') : null
+              );
+              return [icono ? `${icono} ${name}` : `#${name}`];
             }),
           };
         });
@@ -760,7 +813,7 @@ export default function TransactionsScreen() {
     return () => {
       isMounted = false;
     };
-  }, [user?.id, reload]);
+  }, [user?.id, reload, pulsoDatos]);
 
   function toggleTag(list: number[], id: number) {
     return list.includes(id)
@@ -970,6 +1023,8 @@ export default function TransactionsScreen() {
       setEMessage('Transacción actualizada.');
       setEditOpen(false);
       setReload((value) => value + 1);
+      // Index recalcula presupuestos con esta transacción actualizada.
+      notificarCambio();
     } catch (saveError: unknown) {
       setESaving(
         `No se pudo guardar: ${
@@ -980,39 +1035,34 @@ export default function TransactionsScreen() {
   }
 
   function eliminarTransaccion(tx: TransactionDetail) {
-    Alert.alert(
+    confirmar(
       'Eliminar transacción',
       `¿Eliminar esta transacción${tx.merchant ? ` de "${tx.merchant}"` : ''}? Se borrarán también sus artículos y etiquetas.`,
-      [
-        { text: 'Cancelar', style: 'cancel' },
-        {
-          text: 'Eliminar',
-          style: 'destructive',
-          onPress: () => {
-            void (async () => {
-              const transaccionId = Number(tx.id);
-              if (!Number.isFinite(transaccionId)) return;
-              await supabase
-                .from('transaccion_etiquetas')
-                .delete()
-                .eq('transaccion_id', transaccionId);
-              await supabase
-                .from('transaccion_items')
-                .delete()
-                .eq('transaccion_id', transaccionId);
-              const { error: deleteError } = await supabase
-                .from('transacciones')
-                .delete()
-                .eq('id', transaccionId);
-              if (deleteError) {
-                setError(`No se pudo eliminar: ${deleteError.message}`);
-                return;
-              }
-              setReload((value) => value + 1);
-            })();
-          },
-        },
-      ]
+      () => {
+        void (async () => {
+          const transaccionId = Number(tx.id);
+          if (!Number.isFinite(transaccionId)) return;
+          await supabase
+            .from('transaccion_etiquetas')
+            .delete()
+            .eq('transaccion_id', transaccionId);
+          await supabase
+            .from('transaccion_items')
+            .delete()
+            .eq('transaccion_id', transaccionId);
+          const { error: deleteError } = await supabase
+            .from('transacciones')
+            .delete()
+            .eq('id', transaccionId);
+          if (deleteError) {
+            setError(`No se pudo eliminar: ${deleteError.message}`);
+            return;
+          }
+          setReload((value) => value + 1);
+          // Index y presupuestos dejan de contar esta transacción.
+          notificarCambio();
+        })();
+      }
     );
   }
 
@@ -1139,6 +1189,7 @@ export default function TransactionsScreen() {
                   color: (opacity = 1) => `rgba(79, 70, 229, ${opacity})`,
                   labelColor: (opacity = 1) => `rgba(156, 163, 175, ${opacity})`,
                 }}
+                hidePointsAtIndex={indicesPuntosVacios}
                 bezier
                 style={{ marginVertical: 8, borderRadius: 16 }}
               />
@@ -1185,7 +1236,11 @@ export default function TransactionsScreen() {
               <Detail label="Banco" value={transaction.bank} />
               <Detail label="Tipo de cuenta" value={transaction.accountType} />
               <Detail
-                label="Saldo de la cuenta"
+                label={
+                  transaction.accountType === 'credito'
+                    ? 'Cupo disponible'
+                    : 'Saldo de la cuenta'
+                }
                 value={
                   transaction.accountBalance === null
                     ? null
@@ -1233,7 +1288,7 @@ export default function TransactionsScreen() {
                           .join(' · ')}
                         {item.tags.length > 0
                           ? `${item.category || item.subcategory ? ' · ' : ''}${item.tags
-                              .map((tag) => `#${tag}`)
+                              // Cada string ya trae su "#" o icono propio
                               .join(' ')}`
                           : ''}
                       </Text>
@@ -1258,7 +1313,7 @@ export default function TransactionsScreen() {
                     lightColor="#4338ca"
                     darkColor="#c7d2fe"
                   >
-                    #{tag}
+                    {tag}
                   </Text>
                 ))}
               </View>
@@ -1520,7 +1575,7 @@ export default function TransactionsScreen() {
                               : null,
                           ]}
                         >
-                          #{etiqueta.nombre}
+                          {textoEtiqueta(etiqueta)}
                         </Text>
                       </TouchableOpacity>
                     ))}
@@ -1643,7 +1698,7 @@ export default function TransactionsScreen() {
                                   : null,
                               ]}
                             >
-                              #{tag.nombre}
+                              {textoEtiqueta(tag)}
                             </Text>
                           </TouchableOpacity>
                         ))}
@@ -2027,6 +2082,14 @@ const styles = StyleSheet.create({
   },
   fechaText: {
     fontSize: 15,
+  },
+  input: {
+    borderWidth: 1,
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    fontSize: 15,
+    marginBottom: 10,
   },
   labelMini: {
     fontSize: 12,
