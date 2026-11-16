@@ -37,6 +37,21 @@ compra de supermercado es "Alimentos" y cada artículo es un lácteo, una
 fruta, etc.).
 Si te preguntan por los productos de una compra, lista los ARTÍCULOS de
 esa transacción con sus precios exactos tal como aparecen en los datos.
+MUY IMPORTANTE SOBRE TRANSFERENCIAS:
+- Las transferencias entre cuentas del mismo usuario (movimientos cuyo
+  comercio empieza con "Transferencia ... → ...", "Pago tarjeta ..." o
+  "Avance tarjeta ...") son MOVIMIENTOS INTERNOS: NUNCA son ingresos ni
+  gastos, aunque en la base de datos se guarden como un par de filas
+  (una de tipo gasto y otra de tipo ingreso por el mismo monto).
+- No las sumes en totales de gasto ni de ingreso, no las incluyas en el
+  desglose por categoría ni en "comercios donde gastaste".
+- Un pago de tarjeta de crédito o un avance de tarjeta tampoco es gasto ni
+  ingreso: solo mueve deuda/cupo entre cuentas.
+- Si te preguntan por transferencias, descríbelas aparte como movimientos
+  internos, sin mezclarlas con gastos o ingresos.
+- Si el usuario pregunta "cuánto gasté" o "cuánto ingresé", responde con los
+  totales reales (sin transferencias). Si en el resumen aparecen secciones de
+  transferencias, menciónalas solo si aportan a la pregunta.
 Base cada respuesta en los DATOS DEL USUARIO entregados a continuación:
 no inventes movimientos, montos ni fechas que no estén en los datos.
 Si la información no alcanza para responder algo, dilo explícitamente.
@@ -78,12 +93,26 @@ def _texto(valor) -> str:
     return str(valor) if valor else ""
 
 
+def _es_transferencia(nombre_comercio) -> bool:
+    """Detecta movimientos internos creados por la app.
+
+    Las transferencias se guardan como un par gasto+ingreso con un comercio
+    llamado "Transferencia <origen> → <destino>", y los pagos/avances de
+    tarjeta como "Pago Tarjeta · <cuenta>" / "Avance Tarjeta · <cuenta>".
+    Ninguno de estos movimientos es un ingreso o gasto real.
+    """
+    nombre = _texto(nombre_comercio).strip().lower()
+    if nombre.startswith("transferencia ") and "→" in nombre:
+        return True
+    return nombre.startswith(("pago tarjeta", "avance tarjeta"))
+
+
 def _construir_contexto(supabase, user_id: str) -> str:
     secciones: list[str] = []
 
     cuentas = (
         supabase.table("cuentas")
-        .select("id,nombre,tipo,banco,saldo_actual,cupo,dia_corte,dia_pago")
+        .select("id,nombre,tipo,banco,saldo_actual,cupo,dia_corte,dia_pago,tasa_crecimiento")
         .eq("user_id", user_id)
         .execute()
     ).data or []
@@ -185,11 +214,62 @@ def _construir_contexto(supabase, user_id: str) -> str:
         )
         nombres_cuentas = {r["id"]: _texto(r.get("nombre")) for r in (resultado.data or [])}
 
+    # Agrupa las transferencias (par gasto+ingreso) para mostrarlas una sola
+    # vez y marcarlas como movimientos internos.
+    pares_transferencia: dict[tuple, dict[str, list]] = {}
+    for fila in filas:
+        nombre_comercio = comercios.get(fila.get("comercio_id"), "")
+        if not _es_transferencia(nombre_comercio):
+            continue
+        clave = (
+            _texto(fila.get("fecha"))[:10],
+            str(fila.get("total")),
+            fila.get("comercio_id"),
+        )
+        par = pares_transferencia.setdefault(clave, {"gasto": [], "ingreso": []})
+        tipo_fila = _texto(fila.get("tipo"))
+        if tipo_fila == "ingreso":
+            par["ingreso"].append(fila)
+        else:
+            par["gasto"].append(fila)
+
     detalle = ["TRANSACCIONES RECIENTES (más antiguas primero, hasta la más reciente):"]
+    transferencias_emitidas: set[tuple] = set()
     for fila in reversed(filas):
         comercio = comercios.get(fila.get("comercio_id"), "Comercio sin nombre")
         categoria = categorias.get(fila.get("categoria_id"), "Sin categoría")
         cuenta = nombres_cuentas.get(fila.get("cuenta_id"), "Cuenta sin nombre")
+        if _es_transferencia(comercio):
+            clave = (
+                _texto(fila.get("fecha"))[:10],
+                str(fila.get("total")),
+                fila.get("comercio_id"),
+            )
+            if clave in transferencias_emitidas:
+                continue
+            transferencias_emitidas.add(clave)
+            par = pares_transferencia.get(clave, {})
+            origen_fila = (par.get("gasto") or [None])[0]
+            destino_fila = (par.get("ingreso") or [None])[0]
+            origen = (
+                nombres_cuentas.get(origen_fila.get("cuenta_id"), "Cuenta origen")
+                if origen_fila
+                else "Cuenta origen"
+            )
+            destino = (
+                nombres_cuentas.get(destino_fila.get("cuenta_id"), "Cuenta destino")
+                if destino_fila
+                else "Cuenta destino"
+            )
+            veces = max(len(par.get("gasto", [])), 1)
+            sufijo = f" (x{veces})" if veces > 1 else ""
+            detalle.append(
+                f"- {_texto(fila.get('fecha'))[:10]} | {comercio} | "
+                f"{_pesos(fila.get('total'))}{sufijo} | "
+                f"TRANSFERENCIA (movimiento interno, NO es gasto ni ingreso) | "
+                f"{origen} → {destino}"
+            )
+            continue
         detalle.append(
             f"- {_texto(fila.get('fecha'))[:10]} | {comercio} | {_pesos(fila.get('total'))} | "
             f"{categoria} | {_texto(fila.get('tipo')) or 'gasto'} | {cuenta}"
@@ -210,35 +290,69 @@ def _construir_contexto(supabase, user_id: str) -> str:
                 detalle.append(f"  ... y {excedente} artículos más")
     secciones.append("\n".join(detalle))
 
-    por_mes: dict[str, float] = defaultdict(float)
+    por_mes_gasto: dict[str, float] = defaultdict(float)
+    por_mes_ingreso: dict[str, float] = defaultdict(float)
     por_categoria: dict[str, float] = defaultdict(float)
     por_comercio: dict[str, list[float]] = defaultdict(lambda: [0.0, 0])
+    transferencias_gasto: list[float] = []
     for fila in filas:
         monto = float(fila.get("total") or 0)
         mes = _texto(fila.get("fecha"))[:7] or "desconocido"
-        por_mes[mes] += monto
-        if _texto(fila.get("tipo")) != "ingreso":
-            por_categoria[
-                categorias.get(fila.get("categoria_id"), "Sin categoría")
-            ] += monto
-            nom_comercio = comercios.get(fila.get("comercio_id"), "Comercio sin nombre")
-            por_comercio[nom_comercio][0] += monto
-            por_comercio[nom_comercio][1] += 1
+        tipo = _texto(fila.get("tipo"))
+        nombre_comercio = comercios.get(fila.get("comercio_id"), "Comercio sin nombre")
+        if _es_transferencia(nombre_comercio):
+            # Movimiento interno: NUNCA suma como gasto ni ingreso.
+            if tipo != "ingreso":
+                transferencias_gasto.append(monto)
+            continue
+        if tipo == "ingreso":
+            por_mes_ingreso[mes] += monto
+            continue
+        por_mes_gasto[mes] += monto
+        por_categoria[
+            categorias.get(fila.get("categoria_id"), "Sin categoría")
+        ] += monto
+        por_comercio[nombre_comercio][0] += monto
+        por_comercio[nombre_comercio][1] += 1
 
-    resumen = ["RESUMENES (sobre las transacciones anteriores):", "Gasto por mes:"]
-    resumen.extend(f"- {mes}: {_pesos(monto)}" for mes, monto in sorted(por_mes.items()))
-    resumen.append("Gasto por categoría:")
+    resumen = [
+        "RESUMENES (sobre las transacciones anteriores, SIN transferencias):",
+        "Gasto por mes (solo gastos reales):",
+    ]
+    resumen.extend(
+        f"- {mes}: {_pesos(monto)}" for mes, monto in sorted(por_mes_gasto.items())
+    )
+    if not por_mes_gasto:
+        resumen.append("- sin gastos reales registrados")
+    resumen.append("Ingreso por mes (solo ingresos reales):")
+    resumen.extend(
+        f"- {mes}: {_pesos(monto)}" for mes, monto in sorted(por_mes_ingreso.items())
+    )
+    if not por_mes_ingreso:
+        resumen.append("- sin ingresos reales registrados")
+    resumen.append("Gasto por categoría (solo gastos reales):")
     resumen.extend(
         f"- {nombre}: {_pesos(monto)}"
         for nombre, monto in sorted(por_categoria.items(), key=lambda item: -item[1])
     )
-    resumen.append("Comercios más frecuentes:")
+    if not por_categoria:
+        resumen.append("- sin gastos reales registrados")
+    resumen.append("Comercios donde más gastaste (solo gastos reales):")
     resumen.extend(
         f"- {nombre}: {_pesos(total)} en {int(veces)} compras"
         for nombre, (total, veces) in sorted(
             por_comercio.items(), key=lambda item: -item[1][0]
         )[:10]
     )
+    if not por_comercio:
+        resumen.append("- sin gastos reales registrados")
+    if transferencias_gasto:
+        resumen.append(
+            "TRANSFERENCIAS ENTRE CUENTAS (movimientos internos, NO son gasto ni ingreso): "
+            f"{len(transferencias_gasto)} transferencias por "
+            f"{_pesos(sum(transferencias_gasto))} en total. "
+            "No las sumes como gasto ni ingreso."
+        )
     secciones.append("\n".join(resumen))
 
     # PRESUPUESTOS definidos por el usuario

@@ -36,10 +36,11 @@ type AccountRow = {
   cupo: number | null;
   diaCorte: number | null;
   diaPago: number | null;
+  tasaCrecimiento: number | null;
 };
 
 // Debe coincidir con el CHECK cuentas_tipo_check de la base de datos
-const TIPOS_CUENTA = ['efectivo', 'debito', 'credito'] as const;
+const TIPOS_CUENTA = ['efectivo', 'debito', 'credito', 'ahorro'] as const;
 type TipoCuenta = (typeof TIPOS_CUENTA)[number];
 
 // ---- Presupuestos ----
@@ -219,6 +220,7 @@ export default function AccountScreen() {
   const [newCupo, setNewCupo] = useState('');
   const [newDiaCorte, setNewDiaCorte] = useState('');
   const [newDiaPago, setNewDiaPago] = useState('');
+  const [newTasaCrecimiento, setNewTasaCrecimiento] = useState('');
   const [accountSaving, setAccountSaving] = useState(false);
   const authEventReceived = useRef(false);
   const { colorScheme, toggleColorScheme, storageError } = useThemeMode();
@@ -375,7 +377,7 @@ export default function AccountScreen() {
       try {
         const { data, error } = await supabase
           .from('cuentas')
-          .select('id, nombre, tipo, banco, saldo_actual, cupo, dia_corte, dia_pago')
+          .select('id, nombre, tipo, banco, saldo_actual, cupo, dia_corte, dia_pago, tasa_crecimiento')
           .eq('user_id', userId);
 
         if (error) {
@@ -409,6 +411,7 @@ export default function AccountScreen() {
                   cupo: leerNumero(account.cupo),
                   diaCorte: leerNumero(account.dia_corte),
                   diaPago: leerNumero(account.dia_pago),
+                  tasaCrecimiento: leerNumero(account.tasa_crecimiento),
                 },
               ];
             })
@@ -1117,10 +1120,7 @@ export default function AccountScreen() {
   async function handleAddAccount() {
     if (!user) return;
     const nombre = newName.trim();
-    if (!nombre) {
-      setAccountsError('Escribe un nombre para la cuenta.');
-      return;
-    }
+    // Nombre opcional: si está vacío, se usa el tipo como identidad en la fila
     if (!TIPOS_CUENTA.includes(newTipo)) {
       setAccountsError('Elige un tipo de cuenta válido.');
       return;
@@ -1131,6 +1131,7 @@ export default function AccountScreen() {
     let cupo: number | null = null;
     let diaCorte: number | null = null;
     let diaPago: number | null = null;
+    let tasaCrecimiento: number | null = null;
     if (newTipo === 'credito') {
       cupo = inputAmount(limpiarMontoParaEstado(newCupo));
       if (cupo === null) {
@@ -1155,17 +1156,31 @@ export default function AccountScreen() {
       diaPago = pago;
     }
 
+    if (newTipo === 'ahorro') {
+      const tasaStr = newTasaCrecimiento.trim();
+      if (tasaStr !== '') {
+        const tasa = Number(tasaStr);
+        if (!Number.isFinite(tasa) || tasa < 0) {
+          setAccountsError('La tasa de crecimiento debe ser un porcentaje mayor o igual a 0.');
+          return;
+        }
+        tasaCrecimiento = tasa;
+      }
+    }
     setAccountSaving(true);
     setAccountsError('');
     try {
+      const nombreFinal = nombre || (newTipo === 'credito' ? 'Crédito' : newTipo === 'ahorro' ? 'Ahorro' : newTipo === 'debito' ? 'Débito' : 'Efectivo');
       const { error } = await supabase.from('cuentas').insert({
         user_id: user.id,
-        nombre,
+        nombre: nombre.trim() || null,
         tipo: newTipo,
         banco: newBanco.trim() ? newBanco.trim() : null,
         ...(newTipo === 'credito'
           ? { saldo_actual: cupo, cupo, dia_corte: diaCorte, dia_pago: diaPago }
-          : {}),
+          : newTipo === 'ahorro'
+            ? { saldo_actual: 0, tasa_crecimiento: (tasaCrecimiento !== null ? tasaCrecimiento : null) }
+            : {}),
       });
       if (error) {
         setAccountsError(
@@ -1183,6 +1198,7 @@ export default function AccountScreen() {
       setNewCupo('');
       setNewDiaCorte('');
       setNewDiaPago('');
+      setNewTasaCrecimiento('');
       setAddingAccount(false);
       notificarCambio();
     } catch (addError: unknown) {
@@ -1256,7 +1272,7 @@ export default function AccountScreen() {
   // El pago de la tarjeta (transferencia débito → crédito) sí baja el total,
   // porque descuenta el saldo de la cuenta de origen.
   const totalCuentas = accounts.reduce((suma, cuenta) => {
-    if (cuenta.tipo === 'credito') return suma;
+    if (cuenta.tipo === 'credito' || cuenta.tipo === 'ahorro') return suma;
     const saldo = cuenta.saldoActual;
     return typeof saldo === 'number' ? suma + saldo : suma;
   }, 0);
@@ -2336,7 +2352,20 @@ export default function AccountScreen() {
               );
             })}
           </View>
-          {newTipo === 'credito' ? (
+          {newTipo === 'ahorro' ? (
+            <View style={styles.creditoCampos}>
+              <TextInput
+                style={inputStyle}
+                value={newTasaCrecimiento}
+                onChangeText={setNewTasaCrecimiento}
+                placeholder="Tasa de crecimiento anual % (ej: 5)"
+                placeholderTextColor={
+                  colorScheme === 'dark' ? '#9ca3af' : '#6b7280'
+                }
+                keyboardType="numeric"
+              />
+            </View>
+          ) : newTipo === 'credito' ? (
             <View style={styles.creditoCampos}>
               <TextInput
                 style={inputStyle}
@@ -2424,6 +2453,7 @@ export default function AccountScreen() {
         ) : (
           accounts.map((account) => {
             const esCredito = account.tipo === 'credito';
+            const esAhorro = account.tipo === 'ahorro';
             const ciclo = [
               account.diaCorte ? `Corte día ${account.diaCorte}` : null,
               account.diaPago ? `Pago día ${account.diaPago}` : null,
@@ -2460,15 +2490,15 @@ export default function AccountScreen() {
                   darkColor="transparent"
                 >
                   <Text style={styles.accountName}>
-                    {account.nombre ?? 'Cuenta'}
+                    {account.tipo ? (account.tipo === 'debito' ? 'Débito' : account.tipo === 'credito' ? 'Crédito' : account.tipo === 'ahorro' ? 'Ahorro' : account.tipo === 'efectivo' ? 'Efectivo' : account.tipo) : (account.nombre ?? 'Cuenta')}
                   </Text>
-                  {subtitle ? (
+                  {account.banco ? (
                     <Text
                       style={styles.accountSubtitle}
                       lightColor="#6b7280"
                       darkColor="#9ca3af"
                     >
-                      {subtitle}
+                      {account.banco}
                     </Text>
                   ) : null}
                 </View>
@@ -2512,6 +2542,11 @@ export default function AccountScreen() {
                         : formatChileanPesos(account.saldoActual)}
                     </Text>
                   )}
+                  {esAhorro ? (
+                    <Text style={styles.creditoLinea} lightColor="#6b7280" darkColor="#9ca3af">
+                      Crecimiento {account.tasaCrecimiento ?? 0}% anual
+                    </Text>
+                  ) : null}
                   <TouchableOpacity
                     accessibilityRole="button"
                     onPress={() => confirmRemoveAccount(account)}

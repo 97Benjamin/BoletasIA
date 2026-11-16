@@ -555,7 +555,7 @@ export default function ScanReceiptScreen() {
 
       const { data: created, error: insertError } = await supabase
         .from('subcategorias')
-        .insert({ nombre: name, categoria_id: Number(item.categoryId) })
+        .insert({ nombre: name, categoria_id: Number(item.categoryId), user_id: data.user.id })
         .select('id, nombre, categoria_id')
         .single();
       if (insertError) {

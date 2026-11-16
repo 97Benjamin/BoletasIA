@@ -24,9 +24,32 @@ import { formatearMontoEnEntrada, limpiarMontoParaEstado } from '@/src/utils/mon
 import { iconoNormalizado, textoEtiqueta } from '@/src/utils/etiqueta';
 
 type CuentaOpt = { id: number; nombre: string; tipo: string | null; banco: string | null };
+function chipTexto(c: CuentaOpt) {
+  const tipoLbl = c.tipo === 'debito' ? 'Débito' : c.tipo === 'credito' ? 'Crédito' : c.tipo === 'ahorro' ? 'Ahorro' : c.tipo === 'efectivo' ? 'Efectivo' : c.tipo || 'Cuenta';
+  return (c.banco ? tipoLbl + ' · ' + c.banco : tipoLbl);
+}
+
+function sumaItems(items: { precio: string }[]) {
+  return items.reduce(
+    (total, item) => total + (inputAmount(limpiarMontoParaEstado(item.precio)) ?? 0),
+    0
+  );
+}
+
 type CategoriaOpt = { id: number; nombre: string };
 type SubcatOpt = { id: number; nombre: string; categoryId: number };
 type EtiquetaOpt = { id: number; nombre: string; icono?: string | null };
+
+// Artículo de un gasto manual: mismo modelo que los artículos de una boleta
+// escaneada (transaccion_items).
+type QuickItem = {
+  producto: string;
+  precio: string;
+  categoriaId: number | null;
+  subcategoriaId: number | null;
+  etiquetaIds: number[];
+  nuevaEtiqueta: string;
+};
 
 type Recurrente = {
   id: number;
@@ -162,6 +185,8 @@ export default function IngresosGastosScreen() {
   const [qCategoriaId, setQCategoriaId] = useState<number | null>(null);
   const [qSubcatId, setQSubcatId] = useState<number | null>(null);
   const [qTagIds, setQTagIds] = useState<number[]>([]);
+  const [qItems, setQItems] = useState<QuickItem[]>([]);
+  const [qCreandoEtiqueta, setQCreandoEtiqueta] = useState<number | null>(null);
   const [qSaving, setQSaving] = useState(false);
 
   // Confirmación de pendiente recurrente
@@ -436,6 +461,126 @@ export default function IngresosGastosScreen() {
     return list.includes(id)
       ? list.filter((value) => value !== id)
       : [...list, id];
+  }
+
+  function agregarItem() {
+    setQItems((previo) => [
+      ...previo,
+      {
+        producto: '',
+        precio: '',
+        categoriaId: qCategoriaId,
+        subcategoriaId: null,
+        etiquetaIds: [],
+        nuevaEtiqueta: '',
+      },
+    ]);
+  }
+
+  function actualizarItem(index: number, patch: Partial<QuickItem>) {
+    setQItems((previo) =>
+      previo.map((item, i) => (i === index ? { ...item, ...patch } : item))
+    );
+  }
+
+  function quitarItem(index: number) {
+    setQItems((previo) => previo.filter((_, i) => i !== index));
+  }
+
+  function subcatsDeItem(categoriaId: number | null) {
+    if (categoriaId === null) return [];
+    return subcategoriaOptions.filter((sub) => sub.categoryId === categoriaId);
+  }
+
+  async function crearEtiquetaItem(index: number) {
+    const item = qItems[index];
+    const nombre = item?.nuevaEtiqueta.trim();
+    if (!nombre) {
+      setError('Escribe el nombre de la etiqueta que quieres crear.');
+      return;
+    }
+    const existente = etiquetaOptions.find(
+      (etiqueta) =>
+        etiqueta.nombre.toLocaleLowerCase() === nombre.toLocaleLowerCase()
+    );
+    if (existente) {
+      setQItems((previo) =>
+        previo.map((actual, i) =>
+          i === index
+            ? {
+                ...actual,
+                etiquetaIds: actual.etiquetaIds.includes(existente.id)
+                  ? actual.etiquetaIds
+                  : [...actual.etiquetaIds, existente.id],
+                nuevaEtiqueta: '',
+              }
+            : actual
+        )
+      );
+      setError('');
+      return;
+    }
+
+    setError('');
+    setQCreandoEtiqueta(index);
+    try {
+      const { data, error: authError } = await supabase.auth.getUser();
+      if (authError) {
+        throw new Error(`No se pudo validar la sesión: ${authError.message}`);
+      }
+      if (!data.user) {
+        throw new Error('Debes iniciar sesión antes de crear una etiqueta.');
+      }
+
+      const { data: created, error: insertError } = await supabase
+        .from('etiquetas')
+        .insert({ nombre, user_id: data.user.id })
+        .select('id, nombre')
+        .single();
+      if (insertError) {
+        throw new Error(`No se pudo crear la etiqueta: ${insertError.message}`);
+      }
+
+      const createdRecord = created as {
+        id?: unknown;
+        nombre?: unknown;
+      } | null;
+      if (
+        typeof createdRecord?.id !== 'number' ||
+        typeof createdRecord.nombre !== 'string'
+      ) {
+        throw new Error('La base de datos no confirmó la etiqueta creada.');
+      }
+
+      const nueva: EtiquetaOpt = {
+        id: createdRecord.id,
+        nombre: createdRecord.nombre,
+      };
+      setEtiquetaOptions((previo) =>
+        [...previo, nueva].sort((a, b) => a.nombre.localeCompare(b.nombre))
+      );
+      setQItems((previo) =>
+        previo.map((actual, i) =>
+          i === index
+            ? {
+                ...actual,
+                etiquetaIds: [...actual.etiquetaIds, nueva.id],
+                nuevaEtiqueta: '',
+              }
+            : actual
+        )
+      );
+      // Las demás pantallas muestran las etiquetas nuevas sin recargar.
+      notificarCambio();
+    } catch (crearError: unknown) {
+      setError(
+        crearError instanceof Error
+          ? crearError.message
+          : 'No se pudo crear la etiqueta.'
+      );
+    } finally {
+      setQCreandoEtiqueta(null);
+    }
   }
 
   function abrirConfirmacion(info: PendienteInfo) {
@@ -715,10 +860,15 @@ export default function IngresosGastosScreen() {
   async function enviarRapido() {
     if (!user || qSaving) return;
     const nombre = qNombre.trim();
-    const monto = inputAmount(limpiarMontoParaEstado(qMonto));
     const esTransferencia = qTipo === 'transferencia';
-    if (monto === null) {
-      setError('Escribe un monto válido mayor que cero.');
+    const esGasto = qTipo === 'gasto';
+    // En un gasto el total SIEMPRE es la suma de sus artículos.
+    const itemsAGuardar = esGasto ? qItems : [];
+    // Regla: cuentas de ahorro solo permiten transferencias
+    const cuentaSeleccionada = cuentaOptions.find((c) => c.id === qCuentaId);
+    const esAhorro = cuentaSeleccionada?.tipo === 'ahorro';
+    if (esAhorro && !esTransferencia) {
+      setError('Las cuentas de ahorro solo permiten transferencias.');
       return;
     }
     if (!esTransferencia && !nombre) {
@@ -735,7 +885,46 @@ export default function IngresosGastosScreen() {
       );
       return;
     }
+    if (esGasto && itemsAGuardar.length === 0) {
+      setError('Agrega al menos un artículo para registrar el gasto.');
+      return;
+    }
+    for (const [index, item] of itemsAGuardar.entries()) {
+      if (!item.producto.trim()) {
+        setError(`Escribe el nombre del artículo ${index + 1}.`);
+        return;
+      }
+      if (inputAmount(limpiarMontoParaEstado(item.precio)) === null) {
+        setError(`Escribe un precio válido para el artículo ${index + 1}.`);
+        return;
+      }
+      if (item.subcategoriaId !== null && item.categoriaId === null) {
+        setError(`Elige una categoría para el artículo ${index + 1}.`);
+        return;
+      }
+    }
+    const monto = esGasto
+      ? sumaItems(itemsAGuardar) || null
+      : inputAmount(limpiarMontoParaEstado(qMonto));
+    if (monto === null) {
+      setError(
+        esGasto
+          ? 'Agrega artículos con precio para calcular el total del gasto.'
+          : 'Escribe un monto válido mayor que cero.'
+      );
+      return;
+    }
+    const cuentaDestino = cuentaOptions.find((c) => c.id === qCuentaDestinoId);
+    const esDestinoAhorro = cuentaDestino?.tipo === 'ahorro';
+    if (!esTransferencia && esAhorro) {
+      setError('Las cuentas de ahorro solo permiten transferencias.');
+      return;
+    }
     if (esTransferencia) {
+      if (esAhorro && qCuentaDestinoId === qCuentaId) {
+        setError('Una transferencia de ahorro debe ir a otra cuenta (no a sí misma).');
+        return;
+      }
       if (qCuentaId === null || qCuentaDestinoId === null) {
         setError('Elige la cuenta de origen y la cuenta de destino.');
         return;
@@ -831,13 +1020,65 @@ export default function IngresosGastosScreen() {
           throw new Error('La base de datos no devolvió la transacción creada.');
         }
         await guardarEtiquetas(transaccionId, qTagIds);
+        if (itemsAGuardar.length > 0) {
+          try {
+            for (const item of itemsAGuardar) {
+              const { data: itemData, error: itemError } = await supabase
+                .from('transaccion_items')
+                .insert({
+                  transaccion_id: transaccionId,
+                  producto: item.producto.trim(),
+                  precio: String(
+                    inputAmount(limpiarMontoParaEstado(item.precio))
+                  ),
+                  categoria_id: item.categoriaId,
+                  subcategoria_id: item.subcategoriaId,
+                })
+                .select('id')
+                .single();
+              if (itemError) throw itemError;
+              const itemId = (itemData as { id?: unknown } | null)?.id;
+              if (typeof itemId !== 'number') {
+                throw new Error(
+                  'La base de datos no devolvió el artículo creado.'
+                );
+              }
+              if (item.etiquetaIds.length > 0) {
+                const { error: itemTagsError } = await supabase
+                  .from('transaccion_item_etiquetas')
+                  .insert(
+                    item.etiquetaIds.map((etiquetaId) => ({
+                      transaccion_item_id: itemId,
+                      etiqueta_id: etiquetaId,
+                    }))
+                  );
+                if (itemTagsError) throw itemTagsError;
+              }
+            }
+          } catch (itemsError) {
+            // Rollback: no dejar el gasto sin sus artículos o etiquetas.
+            await supabase
+              .from('transacciones')
+              .delete()
+              .eq('id', transaccionId)
+              .eq('user_id', user.id);
+            throw itemsError;
+          }
+        }
         setMessage(
-          `${qTipo === 'gasto' ? 'Gasto' : 'Ingreso'} registrado por ${formatChileanPesos(monto)}.`
+          `${qTipo === 'gasto' ? 'Gasto' : 'Ingreso'} registrado por ${formatChileanPesos(monto)}${
+            itemsAGuardar.length > 0
+              ? ` con ${itemsAGuardar.length} ${
+                  itemsAGuardar.length === 1 ? 'artículo' : 'artículos'
+                }`
+              : ''
+          }.`
         );
       }
       setQNombre('');
       setQMonto('');
       setQFecha(formatFecha(new Date()));
+      setQItems([]);
       // Gasto/ingreso/transferencia nueva: Movimientos y Presupuestos
       // deben recalcularse sin recargar la página.
       notificarCambio();
@@ -1011,17 +1252,19 @@ export default function IngresosGastosScreen() {
             autoCapitalize="sentences"
           />
         ) : null}
-        <TextInput
-          style={inputStyle}
-          value={qMonto}
-          onChangeText={(texto) => {
-            const formateado = formatearMontoEnEntrada(texto);
-            setQMonto(formateado);
-          }}
-          placeholder="Monto (ej: 12.990)"
-          placeholderTextColor={colorScheme === 'dark' ? '#9ca3af' : '#6b7280'}
-          keyboardType={Platform.OS === 'web' ? 'default' : 'numeric'}
-        />
+        {qTipo !== 'gasto' ? (
+          <TextInput
+            style={inputStyle}
+            value={qMonto}
+            onChangeText={(texto) => {
+              const formateado = formatearMontoEnEntrada(texto);
+              setQMonto(formateado);
+            }}
+            placeholder="Monto (ej: 12.990)"
+            placeholderTextColor={colorScheme === 'dark' ? '#9ca3af' : '#6b7280'}
+            keyboardType={Platform.OS === 'web' ? 'default' : 'numeric'}
+          />
+        ) : null}
 
         <SelectorFecha
           valor={qFecha}
@@ -1046,7 +1289,7 @@ export default function IngresosGastosScreen() {
               contentContainerStyle={styles.chipRow}
               style={styles.chipScroll}
             >
-              {cuentaOptions.map((cuenta) => (
+              {cuentaOptions.filter((cuenta) => (qTipo as string) === 'transferencia' || cuenta.tipo !== 'ahorro').map((cuenta) => (
                 <TouchableOpacity
                   key={cuenta.id}
                   accessibilityRole="button"
@@ -1059,7 +1302,7 @@ export default function IngresosGastosScreen() {
                       qCuentaId === cuenta.id ? styles.chipTextActivo : null,
                     ]}
                   >
-                    {cuenta.banco ? `${cuenta.nombre} · ${cuenta.banco}` : cuenta.nombre}
+                    {chipTexto(cuenta)}
                   </Text>
                 </TouchableOpacity>
               ))}
@@ -1073,7 +1316,7 @@ export default function IngresosGastosScreen() {
               contentContainerStyle={styles.chipRow}
               style={styles.chipScroll}
             >
-              {cuentaOptions.map((cuenta) => (
+              {cuentaOptions.filter((cuenta) => (qTipo as string) === 'transferencia' || cuenta.tipo !== 'ahorro').map((cuenta) => (
                 <TouchableOpacity
                   key={cuenta.id}
                   accessibilityRole="button"
@@ -1089,7 +1332,7 @@ export default function IngresosGastosScreen() {
                       qCuentaDestinoId === cuenta.id ? styles.chipTextActivo : null,
                     ]}
                   >
-                    {cuenta.nombre}
+                    {chipTexto(cuenta)}
                   </Text>
                 </TouchableOpacity>
               ))}
@@ -1106,7 +1349,7 @@ export default function IngresosGastosScreen() {
               contentContainerStyle={styles.chipRow}
               style={styles.chipScroll}
             >
-              {cuentaOptions.map((cuenta) => (
+              {cuentaOptions.filter((cuenta) => (qTipo as string) === 'transferencia' || cuenta.tipo !== 'ahorro').map((cuenta) => (
                 <TouchableOpacity
                   key={cuenta.id}
                   accessibilityRole="button"
@@ -1119,7 +1362,7 @@ export default function IngresosGastosScreen() {
                       qCuentaId === cuenta.id ? styles.chipTextActivo : null,
                     ]}
                   >
-                    {cuenta.banco ? `${cuenta.nombre} · ${cuenta.banco}` : cuenta.nombre}
+                    {chipTexto(cuenta)}
                   </Text>
                 </TouchableOpacity>
               ))}
@@ -1257,6 +1500,313 @@ export default function IngresosGastosScreen() {
                 </TouchableOpacity>
               ))}
             </ScrollView>
+          </>
+        ) : null}
+
+        {qTipo === 'gasto' ? (
+          <>
+            <View
+              style={styles.itemsHeader}
+              lightColor="transparent"
+              darkColor="transparent"
+            >
+              <Text style={styles.labelMini} lightColor="#6b7280" darkColor="#9ca3af">
+                Artículos del gasto
+              </Text>
+              <TouchableOpacity accessibilityRole="button" onPress={agregarItem}>
+                <Text style={styles.agregarText}>＋ Agregar artículo</Text>
+              </TouchableOpacity>
+            </View>
+            {qItems.length === 0 ? (
+              <Text
+                style={styles.itemAyuda}
+                lightColor="#6b7280"
+                darkColor="#9ca3af"
+              >
+                Agrega al menos un artículo; el total se calcula sumando los
+                precios.
+              </Text>
+            ) : null}
+            {qItems.map((item, index) => {
+              const subcats = subcatsDeItem(item.categoriaId);
+              return (
+                <View
+                  key={`qitem-${index}`}
+                  style={styles.itemCard}
+                  lightColor="#f9fafb"
+                  darkColor="#111827"
+                >
+                  <View
+                    style={styles.itemHeader}
+                    lightColor="transparent"
+                    darkColor="transparent"
+                  >
+                    <Text style={styles.itemHeading}>Artículo {index + 1}</Text>
+                    <TouchableOpacity
+                      accessibilityRole="button"
+                      disabled={qCreandoEtiqueta !== null}
+                      onPress={() => quitarItem(index)}
+                    >
+                      <Text style={styles.removeText}>Quitar</Text>
+                    </TouchableOpacity>
+                  </View>
+                  <TextInput
+                    accessibilityLabel={`Nombre del artículo ${index + 1}`}
+                    value={item.producto}
+                    onChangeText={(producto) =>
+                      actualizarItem(index, { producto })
+                    }
+                    placeholder="Nombre del artículo"
+                    placeholderTextColor={
+                      colorScheme === 'dark' ? '#9ca3af' : '#6b7280'
+                    }
+                    style={inputStyle}
+                  />
+                  <TextInput
+                    accessibilityLabel={`Precio del artículo ${index + 1}`}
+                    value={item.precio}
+                    onChangeText={(precio) =>
+                      actualizarItem(index, {
+                        precio: formatearMontoEnEntrada(precio),
+                      })
+                    }
+                    placeholder="Precio (ej: 1.990)"
+                    placeholderTextColor={
+                      colorScheme === 'dark' ? '#9ca3af' : '#6b7280'
+                    }
+                    keyboardType={Platform.OS === 'web' ? 'default' : 'numeric'}
+                    style={inputStyle}
+                  />
+                  <Text style={styles.labelMini} lightColor="#6b7280" darkColor="#9ca3af">
+                    Categoría del artículo
+                  </Text>
+                  <ScrollView
+                    horizontal
+                    showsHorizontalScrollIndicator={false}
+                    contentContainerStyle={styles.chipRow}
+                    style={styles.chipScroll}
+                  >
+                    <TouchableOpacity
+                      accessibilityRole="button"
+                      onPress={() =>
+                        actualizarItem(index, {
+                          categoriaId: null,
+                          subcategoriaId: null,
+                        })
+                      }
+                      style={[
+                        chipInactivo,
+                        item.categoriaId === null && styles.chipActivo,
+                      ]}
+                    >
+                      <Text
+                        style={[
+                          chipTextoInactivo,
+                          item.categoriaId === null
+                            ? styles.chipTextActivo
+                            : null,
+                        ]}
+                      >
+                        Sin categoría
+                      </Text>
+                    </TouchableOpacity>
+                    {categoriaOptions.map((categoria) => (
+                      <TouchableOpacity
+                        key={categoria.id}
+                        accessibilityRole="button"
+                        onPress={() =>
+                          actualizarItem(index, {
+                            categoriaId: categoria.id,
+                            subcategoriaId: null,
+                          })
+                        }
+                        style={[
+                          chipInactivo,
+                          item.categoriaId === categoria.id && styles.chipActivo,
+                        ]}
+                      >
+                        <Text
+                          style={[
+                            chipTextoInactivo,
+                            item.categoriaId === categoria.id
+                              ? styles.chipTextActivo
+                              : null,
+                          ]}
+                        >
+                          {categoria.nombre}
+                        </Text>
+                      </TouchableOpacity>
+                    ))}
+                  </ScrollView>
+                  {subcats.length > 0 ? (
+                    <>
+                      <Text style={styles.labelMini} lightColor="#6b7280" darkColor="#9ca3af">
+                        Subcategoría
+                      </Text>
+                      <ScrollView
+                        horizontal
+                        showsHorizontalScrollIndicator={false}
+                        contentContainerStyle={styles.chipRow}
+                        style={styles.chipScroll}
+                      >
+                        <TouchableOpacity
+                          accessibilityRole="button"
+                          onPress={() =>
+                            actualizarItem(index, { subcategoriaId: null })
+                          }
+                          style={[
+                            chipInactivo,
+                            item.subcategoriaId === null && styles.chipActivo,
+                          ]}
+                        >
+                          <Text
+                            style={[
+                              chipTextoInactivo,
+                              item.subcategoriaId === null
+                                ? styles.chipTextActivo
+                                : null,
+                            ]}
+                          >
+                            Ninguna
+                          </Text>
+                        </TouchableOpacity>
+                        {subcats.map((sub) => (
+                          <TouchableOpacity
+                            key={sub.id}
+                            accessibilityRole="button"
+                            onPress={() =>
+                              actualizarItem(index, { subcategoriaId: sub.id })
+                            }
+                            style={[
+                              chipInactivo,
+                              item.subcategoriaId === sub.id &&
+                                styles.chipActivo,
+                            ]}
+                          >
+                            <Text
+                              style={[
+                                chipTextoInactivo,
+                                item.subcategoriaId === sub.id
+                                  ? styles.chipTextActivo
+                                  : null,
+                              ]}
+                            >
+                              {sub.nombre}
+                            </Text>
+                          </TouchableOpacity>
+                        ))}
+                      </ScrollView>
+                    </>
+                  ) : null}
+                  <Text style={styles.labelMini} lightColor="#6b7280" darkColor="#9ca3af">
+                    Etiquetas del artículo
+                  </Text>
+                  {etiquetaOptions.length > 0 ? (
+                    <ScrollView
+                      horizontal
+                      showsHorizontalScrollIndicator={false}
+                      contentContainerStyle={styles.chipRow}
+                      style={styles.chipScroll}
+                    >
+                      {etiquetaOptions.map((etiqueta) => (
+                        <TouchableOpacity
+                          key={etiqueta.id}
+                          accessibilityRole="button"
+                          onPress={() =>
+                            actualizarItem(index, {
+                              etiquetaIds: item.etiquetaIds.includes(etiqueta.id)
+                                ? item.etiquetaIds.filter(
+                                    (id) => id !== etiqueta.id
+                                  )
+                                : [...item.etiquetaIds, etiqueta.id],
+                            })
+                          }
+                          style={[
+                            chipInactivo,
+                            item.etiquetaIds.includes(etiqueta.id) &&
+                              styles.chipActivo,
+                          ]}
+                        >
+                          <Text
+                            style={[
+                              chipTextoInactivo,
+                              item.etiquetaIds.includes(etiqueta.id)
+                                ? styles.chipTextActivo
+                                : null,
+                            ]}
+                          >
+                            {textoEtiqueta(etiqueta)}
+                          </Text>
+                        </TouchableOpacity>
+                      ))}
+                    </ScrollView>
+                  ) : (
+                    <Text
+                      style={styles.itemAyuda}
+                      lightColor="#6b7280"
+                      darkColor="#9ca3af"
+                    >
+                      Aún no tienes etiquetas. Puedes crear una aquí.
+                    </Text>
+                  )}
+                  <TextInput
+                    accessibilityLabel={`Nueva etiqueta del artículo ${index + 1}`}
+                    value={item.nuevaEtiqueta}
+                    onChangeText={(nuevaEtiqueta) =>
+                      actualizarItem(index, { nuevaEtiqueta })
+                    }
+                    editable={qCreandoEtiqueta === null}
+                    placeholder="Nueva etiqueta del artículo"
+                    placeholderTextColor={
+                      colorScheme === 'dark' ? '#9ca3af' : '#6b7280'
+                    }
+                    style={inputStyle}
+                  />
+                  <TouchableOpacity
+                    accessibilityRole="button"
+                    onPress={() => void crearEtiquetaItem(index)}
+                    disabled={
+                      qCreandoEtiqueta !== null ||
+                      !item.nuevaEtiqueta.trim()
+                    }
+                    style={[
+                      styles.miniBoton,
+                      (qCreandoEtiqueta !== null ||
+                        !item.nuevaEtiqueta.trim()) &&
+                        styles.miniBotonDisabled,
+                    ]}
+                  >
+                    {qCreandoEtiqueta === index ? (
+                      <ActivityIndicator size="small" color="#4338ca" />
+                    ) : (
+                      <Text style={styles.miniBotonText}>
+                        Crear y asignar etiqueta
+                      </Text>
+                    )}
+                  </TouchableOpacity>
+                </View>
+              );
+            })}
+            <View
+              style={[
+                styles.totalGastoBox,
+                {
+                  borderColor: inputColors.borderColor,
+                  backgroundColor: inputColors.backgroundColor,
+                },
+              ]}
+              lightColor="transparent"
+              darkColor="transparent"
+            >
+              <Text style={styles.labelMini} lightColor="#6b7280" darkColor="#9ca3af">
+                Total del gasto (suma de artículos)
+              </Text>
+              <Text
+                style={[styles.totalGastoValor, { color: inputColors.color }]}
+              >
+                {formatChileanPesos(sumaItems(qItems))}
+              </Text>
+            </View>
           </>
         ) : null}
           </>
@@ -1596,7 +2146,7 @@ export default function IngresosGastosScreen() {
                 contentContainerStyle={styles.chipRow}
                 style={styles.chipScroll}
               >
-                {cuentaOptions.map((cuenta) => (
+                {cuentaOptions.filter((cuenta) => (qTipo as string) === 'transferencia' || cuenta.tipo !== 'ahorro').map((cuenta) => (
                   <TouchableOpacity
                     key={cuenta.id}
                     accessibilityRole="button"
@@ -1609,7 +2159,7 @@ export default function IngresosGastosScreen() {
                         rCuentaId === cuenta.id ? styles.chipTextActivo : null,
                       ]}
                     >
-                      {cuenta.banco ? `${cuenta.nombre} · ${cuenta.banco}` : cuenta.nombre}
+                      {chipTexto(cuenta)}
                     </Text>
                   </TouchableOpacity>
                 ))}
@@ -1926,6 +2476,18 @@ const styles = StyleSheet.create({
     fontSize: 15,
     marginBottom: 10,
   },
+  totalGastoBox: {
+    borderWidth: 1,
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    marginBottom: 10,
+  },
+  totalGastoValor: {
+    fontSize: 22,
+    fontWeight: '700',
+    marginTop: 2,
+  },
   fechaText: {
     fontSize: 15,
   },
@@ -1934,6 +2496,38 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     marginTop: 4,
     marginBottom: 6,
+  },
+  itemsHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginTop: 8,
+  },
+  itemAyuda: {
+    fontSize: 13,
+    marginBottom: 8,
+  },
+  itemCard: {
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    padding: 12,
+    marginBottom: 10,
+  },
+  itemHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 8,
+  },
+  itemHeading: {
+    fontSize: 15,
+    fontWeight: '600',
+  },
+  removeText: {
+    color: '#b91c1c',
+    fontWeight: '600',
+    fontSize: 13,
   },
   guardarButton: {
     alignItems: 'center',
@@ -1987,6 +2581,9 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#c7d2fe',
     backgroundColor: '#e0e7ff',
+  },
+  miniBotonDisabled: {
+    opacity: 0.5,
   },
   miniBotonText: {
     color: '#4338ca',
