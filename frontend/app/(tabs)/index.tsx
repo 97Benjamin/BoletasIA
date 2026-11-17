@@ -53,6 +53,13 @@ type PresupuestoRegla = {
   tipo: ReglaTipo;
   refId: number;
 };
+type TrxItem = {
+  id: number;
+  precio: number;
+  categoriaId: number | null;
+  subcategoriaId: number | null;
+  etiquetaIds: number[];
+};
 type TrxMes = {
   id: number;
   fecha: string; // YYYY-MM-DD
@@ -62,14 +69,18 @@ type TrxMes = {
   etiquetaIds: number[];
   comercioNombre: string | null;
   cuentaId: number | null;
+  items: TrxItem[];
 };
+// Gasto dentro de un presupuesto: monto es lo que se atribuye al presupuesto
+// (total de la transacción o solo la suma de los artículos que coinciden).
+type TrxPresupuesto = TrxMes & { monto: number };
 type PresupuestoDetalle = {
   id: number;
   nombre: string;
   montoMensual: number;
   reglas: PresupuestoRegla[];
   gastado: number;
-  transacciones: TrxMes[];
+  transacciones: TrxPresupuesto[];
 };
 
 // ---- Editor de catálogo (Mi cuenta) ----
@@ -175,6 +186,31 @@ function trxCumpleReglas(trx: TrxMes, reglas: PresupuestoRegla[]) {
     }
     return trx.etiquetaIds.includes(regla.refId);
   });
+}
+
+function itemCumpleReglas(item: TrxItem, reglas: PresupuestoRegla[]) {
+  return reglas.some((regla) => {
+    if (regla.tipo === 'categoria') {
+      return item.categoriaId === regla.refId;
+    }
+    if (regla.tipo === 'subcategoria') {
+      return item.subcategoriaId === regla.refId;
+    }
+    return item.etiquetaIds.includes(regla.refId);
+  });
+}
+
+// Monto de una transacción que corresponde a un presupuesto:
+// - Si la transacción calza por su propia categoría/subcategoría/etiqueta, se
+//   cuenta el total completo (una sola vez).
+// - Si no, se suman solo los precios de los artículos que calzan, para no
+//   atribuir al presupuesto artículos de otras categorías.
+function montoEnPresupuesto(trx: TrxMes, reglas: PresupuestoRegla[]) {
+  if (trxCumpleReglas(trx, reglas)) return trx.total;
+  return trx.items.reduce(
+    (suma, item) => (itemCumpleReglas(item, reglas) ? suma + item.precio : suma),
+    0
+  );
 }
 
 // En nativo se leen los bytes de la imagen con expo-file-system (lazy para
@@ -628,6 +664,21 @@ export default function AccountScreen() {
             .select('transaccion_id, etiqueta_id')
             .in('transaccion_id', trxIds)
         : { data: [], error: null };
+      const trxItemResult = trxIds.length
+        ? await supabase
+            .from('transaccion_items')
+            .select('id, transaccion_id, precio, categoria_id, subcategoria_id')
+            .in('transaccion_id', trxIds)
+        : { data: [], error: null };
+      const trxItemIds = (trxItemResult.data ?? []).flatMap((row) =>
+        typeof row?.id === 'number' ? [row.id] : []
+      );
+      const trxItemTagResult = trxItemIds.length
+        ? await supabase
+            .from('transaccion_item_etiquetas')
+            .select('transaccion_item_id, etiqueta_id')
+            .in('transaccion_item_id', trxItemIds)
+        : { data: [], error: null };
       const comercioIds = [
         ...new Set(
           transTemp
@@ -642,7 +693,13 @@ export default function AccountScreen() {
             .in('id', comercioIds)
         : { data: [], error: null };
       if (!isMounted) return;
-      for (const result of [reglasResult, trxTagResult, comerciosResult]) {
+      for (const result of [
+        reglasResult,
+        trxTagResult,
+        trxItemResult,
+        trxItemTagResult,
+        comerciosResult,
+      ]) {
         if (result.error) throw new Error(result.error.message);
       }
 
@@ -656,6 +713,43 @@ export default function AccountScreen() {
           lista.push(row.etiqueta_id);
           etiquetasPorTrx.set(row.transaccion_id, lista);
         }
+      }
+      const etiquetasPorItem = new Map<number, number[]>();
+      for (const row of trxItemTagResult.data ?? []) {
+        if (
+          typeof row?.transaccion_item_id === 'number' &&
+          typeof row?.etiqueta_id === 'number'
+        ) {
+          const lista = etiquetasPorItem.get(row.transaccion_item_id) ?? [];
+          lista.push(row.etiqueta_id);
+          etiquetasPorItem.set(row.transaccion_item_id, lista);
+        }
+      }
+      const itemsPorTrx = new Map<number, TrxItem[]>();
+      for (const row of trxItemResult.data ?? []) {
+        const id = typeof row?.id === 'number' ? row.id : null;
+        const transaccionId =
+          typeof row?.transaccion_id === 'number' ? row.transaccion_id : null;
+        const precio =
+          typeof row?.precio === 'number'
+            ? row.precio
+            : typeof row?.precio === 'string' && Number.isFinite(Number(row.precio))
+              ? Number(row.precio)
+              : null;
+        if (id === null || transaccionId === null || precio === null) continue;
+        const lista = itemsPorTrx.get(transaccionId) ?? [];
+        lista.push({
+          id,
+          precio,
+          categoriaId:
+            typeof row?.categoria_id === 'number' ? row.categoria_id : null,
+          subcategoriaId:
+            typeof row?.subcategoria_id === 'number'
+              ? row.subcategoria_id
+              : null,
+          etiquetaIds: etiquetasPorItem.get(id) ?? [],
+        });
+        itemsPorTrx.set(transaccionId, lista);
       }
       const comerciosMap: Record<number, string> = {};
       for (const row of comerciosResult.data ?? []) {
@@ -673,6 +767,7 @@ export default function AccountScreen() {
         comercioNombre:
           trx.comercioId !== null ? comerciosMap[trx.comercioId] ?? null : null,
         cuentaId: trx.cuentaId,
+        items: itemsPorTrx.get(trx.id) ?? [],
       }));
 
       const reglasPorPresupuesto = new Map<number, PresupuestoRegla[]>();
@@ -698,15 +793,15 @@ export default function AccountScreen() {
 
       const detalle: PresupuestoDetalle[] = presupuestoRows.map((pres) => {
         const reglas = reglasPorPresupuesto.get(pres.id) ?? [];
-        const propias = transacciones.filter((trx) =>
-          trxCumpleReglas(trx, reglas)
-        );
+        const propias = transacciones
+          .map((trx) => ({ ...trx, monto: montoEnPresupuesto(trx, reglas) }))
+          .filter((trx) => trx.monto > 0);
         return {
           id: pres.id,
           nombre: pres.nombre,
           montoMensual: pres.monto,
           reglas,
-          gastado: propias.reduce((suma, trx) => suma + trx.total, 0),
+          gastado: propias.reduce((suma, trx) => suma + trx.monto, 0),
           transacciones: propias,
         };
       });
@@ -2608,7 +2703,9 @@ export default function AccountScreen() {
         lightColor="#6b7280"
         darkColor="#9ca3af"
       >
-        Cuánto llevas gastado este mes en cada presupuesto.
+        Cuánto llevas gastado este mes en cada presupuesto. Se cuentan la
+        categoría, la subcategoría y las etiquetas de la transacción y también
+        las de sus artículos.
       </Text>
 
       {presupuestosLoading ? (
@@ -2832,6 +2929,7 @@ export default function AccountScreen() {
                               >
                                 {fechaChilena(trx.fecha)}
                                 {cuentaNombre ? ` · ${cuentaNombre}` : ''}
+                                {trx.monto < trx.total ? ' · según artículos' : ''}
                               </Text>
                             </View>
                             <Text
@@ -2839,7 +2937,7 @@ export default function AccountScreen() {
                               lightColor="#b91c1c"
                               darkColor="#f87171"
                             >
-                              −{formatChileanPesos(trx.total)}
+                              −{formatChileanPesos(trx.monto)}
                             </Text>
                           </View>
                         );
